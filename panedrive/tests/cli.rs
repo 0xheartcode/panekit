@@ -79,3 +79,31 @@ fn bad_condition_is_a_usage_error_exit_2() {
     assert_eq!(code(cmd), 2, "unparseable condition should exit 2");
     fs::remove_file(&state).ok();
 }
+
+#[test]
+fn type_requires_exactly_one_text_source() {
+    // These fail during source resolution, before any backend is touched.
+    let mut none = bin();
+    none.args(["type", "--pane", "x"]);
+    assert_eq!(code(none), 2, "no text source should be a usage error");
+
+    let mut two = bin();
+    two.args(["type", "hello", "--stdin", "--pane", "x"]);
+    assert_eq!(code(two), 2, "literal + --stdin should be a usage error");
+
+    let mut env_missing = bin();
+    env_missing
+        .args([
+            "type",
+            "--from-env",
+            "PANEDRIVE_DEFINITELY_UNSET",
+            "--pane",
+            "x",
+        ])
+        .env_remove("PANEDRIVE_DEFINITELY_UNSET");
+    assert_eq!(
+        code(env_missing),
+        2,
+        "unset env var should be a usage error"
+    );
+}

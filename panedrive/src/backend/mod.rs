@@ -20,4 +20,16 @@ pub trait PaneBackend {
     /// Capture the pane's currently visible text (best-effort; used only when
     /// no [`paneview`](https://docs.rs/paneview) JSON seam is available).
     fn capture(&self) -> io::Result<String>;
+
+    /// Deliver literal text to the pane as a block rather than key events.
+    ///
+    /// The default types it character by character. The tmux backend overrides
+    /// this to route the text through a tmux buffer, so the value never appears
+    /// in a `tmux send-keys` argv; use it for secrets. A PTY backend is already
+    /// argv-safe (it writes straight to the pseudo-terminal), so the default is
+    /// fine there.
+    fn paste_text(&self, text: &str) -> io::Result<()> {
+        let keys: Vec<Key> = text.chars().map(Key::Char).collect();
+        self.send_keys(&keys)
+    }
 }

@@ -91,6 +91,32 @@ backend error.
 Equality is numeric-aware: `count=2` matches a JSON `2` or `2.0` (and `1e3`
 matches `1000`); non-numeric scalars compare as text.
 
+## Secrets
+
+To enter a value without it landing in argv or shell history, read it from stdin
+or an environment variable instead of a literal argument:
+
+```bash
+read -rs VAULT_PASS
+printf %s "$VAULT_PASS" | panedrive type --stdin --pane mysession:1.0
+# or
+panedrive type --from-env VAULT_PASS --pane mysession:1.0
+```
+
+Transport matters too, not just the source:
+
+- The **PTY backend** writes bytes straight to the pseudo-terminal (no argv), so
+  it is leak-free end to end. Prefer it for secrets.
+- The **tmux backend** normally transits the text through `tmux send-keys` argv.
+  Add `--paste` to route it through a tmux buffer (`load-buffer` + `paste-buffer`,
+  deleted after paste) so it never appears in argv.
+
+Honest limits: the target program still receives the value (that is the point),
+root can read process memory, and it may echo on screen unless the field masks
+it. `panedrive` only shrinks its own exposure. When the app can ingest a secret
+directly (its own stdin, a keyring, a fifo), prefer that over simulating
+keystrokes.
+
 ## Backends
 
 `panedrive` drives through a single `PaneBackend` trait, so the host is the only

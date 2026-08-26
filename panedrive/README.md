@@ -16,6 +16,13 @@ Input goes through the real keybindings of the real running UI; output is read
 from the [`paneview`](https://crates.io/crates/paneview) state seam, so asserts
 are deterministic with no screen-scraping.
 
+For secrets, read the value from stdin or an env var instead of argv, and use
+the PTY backend or tmux `--paste` so it does not transit `send-keys` argv:
+
+```bash
+panedrive type --from-env VAULT_PASS --paste --pane mysession:1.0
+```
+
 ## Backends
 
 Driving is abstracted behind one `PaneBackend` trait:

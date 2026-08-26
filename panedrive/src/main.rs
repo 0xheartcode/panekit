@@ -11,6 +11,7 @@
 //! `2` usage or backend error. That makes `assert` and `wait-until` usable as
 //! shell gates and in CI.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -42,15 +43,29 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Backend::Tmux)]
         backend: Backend,
     },
-    /// Type a literal string, character by character (e.g. a passphrase or a
-    /// value into a text field). Use `press` for named keys like Enter/arrows.
+    /// Type a literal string into the pane (e.g. a value into a text field).
+    ///
+    /// For secrets, read the value from `--stdin` or `--from-env` so it never
+    /// lands in argv or shell history, and prefer the PTY backend or tmux
+    /// `--paste` so it does not transit `tmux send-keys` argv either.
     Type {
-        /// The literal text to type. Quote it to include spaces.
-        text: String,
+        /// The literal text to type. Omit when using --stdin or --from-env.
+        text: Option<String>,
+        /// Read the text from stdin (covers files, fifos, and `read -s` pipes).
+        #[arg(long)]
+        stdin: bool,
+        /// Read the text from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        from_env: Option<String>,
         #[arg(long)]
         pane: String,
         #[arg(long, value_enum, default_value_t = Backend::Tmux)]
         backend: Backend,
+        /// tmux only: deliver via a tmux buffer (load-buffer + paste-buffer) so
+        /// the text never transits `tmux send-keys` argv. The PTY backend is
+        /// already argv-safe, so this is a no-op there.
+        #[arg(long)]
+        paste: bool,
     },
     /// Print the pane's visible text (fallback when no JSON seam exists).
     Capture {
@@ -125,11 +140,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Cmd::Type {
             text,
+            stdin,
+            from_env,
             pane,
             backend,
+            paste,
         } => {
-            let keys: Vec<Key> = text.chars().map(Key::Char).collect();
-            backend_for(backend, pane).send_keys(&keys)?;
+            let text = resolve_type_text(text, stdin, from_env)?;
+            let backend = backend_for(backend, pane);
+            if paste {
+                backend.paste_text(&text)?;
+            } else {
+                let keys: Vec<Key> = text.chars().map(Key::Char).collect();
+                backend.send_keys(&keys)?;
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Capture { pane, backend } => {
@@ -193,6 +217,36 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             eprintln!("recorded {n} sample(s)");
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Resolve the text for `type` from exactly one source: a literal argument,
+/// stdin, or an environment variable. More than one, or none, is a usage error.
+fn resolve_type_text(
+    text: Option<String>,
+    stdin: bool,
+    from_env: Option<String>,
+) -> anyhow::Result<String> {
+    match (text, stdin, from_env) {
+        (Some(t), false, None) => Ok(t),
+        (None, true, None) => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            // Strip one trailing line ending so `echo secret |` and
+            // `printf %s "$s" |` both yield the same value.
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            Ok(s)
+        }
+        (None, false, Some(var)) => std::env::var(&var)
+            .map_err(|_| anyhow::anyhow!("environment variable {var} is not set")),
+        _ => anyhow::bail!(
+            "provide exactly one text source: a literal argument, --stdin, or --from-env VAR"
+        ),
     }
 }
 

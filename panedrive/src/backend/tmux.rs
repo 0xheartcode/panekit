@@ -5,8 +5,8 @@
 
 use super::PaneBackend;
 use crate::key::{Key, TmuxKey};
-use std::io;
-use std::process::Command;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 
 /// Drives a single tmux pane, addressed by any tmux target (`session:win.pane`,
 /// `%id`, or a bare pane index).
@@ -82,5 +82,34 @@ impl PaneBackend for TmuxBackend {
             )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn paste_text(&self, text: &str) -> io::Result<()> {
+        // Load the text into a tmux buffer from STDIN so it never appears in an
+        // argv (unlike `send-keys -l "<text>"`), then paste it into the pane and
+        // delete the buffer so the secret does not linger in tmux.
+        let buffer = format!("panedrive-{}", std::process::id());
+        let mut child = Command::new("tmux")
+            .args(["load-buffer", "-b", &buffer, "-"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("tmux load-buffer: no stdin handle"))?
+            .write_all(text.as_bytes())?;
+        if !child.wait()?.success() {
+            return Err(io::Error::other("tmux load-buffer failed"));
+        }
+        let status = Command::new("tmux")
+            .args(["paste-buffer", "-d", "-b", &buffer, "-t", &self.pane])
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "tmux paste-buffer failed for pane {}",
+                self.pane
+            )));
+        }
+        Ok(())
     }
 }
