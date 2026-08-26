@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["paneview", "panedrive"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["0xheartcode"]
+repository = "https://github.com/0xheartcode/panekit"
+homepage = "https://github.com/0xheartcode/panekit"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+paneview = { path = "paneview", version = "0.1.0" }
+
+# external
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# local, untracked project tooling (not part of the published crate)
+/local/
+
+# panedrive state snapshots (per-run; never source)
+*.state.json
+*.state.json.tmp
+
+# misc
+.DS_Store
+*.log

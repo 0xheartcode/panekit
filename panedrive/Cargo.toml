@@ -1,0 +1,39 @@
+[package]
+name = "panedrive"
+description = "Headless driver for terminal UIs: press keys, wait on a JSON state seam, assert. tmux backend today; zellij/PTY pluggable."
+keywords = ["tui", "terminal", "tmux", "testing", "automation"]
+categories = ["development-tools::testing", "command-line-utilities"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "panedrive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panedrive"
+path = "src/main.rs"
+
+[[example]]
+name = "pty_drive_counter"
+required-features = ["pty"]
+
+[features]
+# The PTY backend (drive a TUI with no multiplexer, ideal for CI). Pulls
+# portable-pty + vt100; off by default so tmux-only users stay lean.
+pty = ["dep:portable-pty", "dep:vt100"]
+
+[dependencies]
+paneview = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+portable-pty = { version = "0.8", optional = true }
+vt100 = { version = "0.15", optional = true }

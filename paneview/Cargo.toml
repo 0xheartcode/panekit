@@ -1,0 +1,17 @@
+[package]
+name = "paneview"
+description = "The state seam a terminal UI exposes so agents and tests can read its state as JSON instead of scraping the screen."
+keywords = ["tui", "terminal", "testing", "json", "snapshot"]
+categories = ["development-tools::testing"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
