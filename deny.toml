@@ -1,0 +1,40 @@
+# Supply-chain wall for panekit. `cargo deny check` gates on:
+#   - advisories: known RUSTSEC vulnerabilities + unmaintained/yanked crates
+#   - bans:       duplicate versions (dependency bloat / version skew)
+#   - sources:    crates only from crates.io (no surprise git/registry sources)
+#   - licenses:   only permissive licenses we've vetted
+# Covers both the default build and the optional `pty` feature (portable-pty + vt100).
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # `serial` (via portable-pty, only under the `pty` feature) is unmaintained,
+    # not vulnerable. portable-pty 0.8 still depends on it; no safe upgrade path
+    # without portable-pty dropping it. Serial-port shim, not on our code path.
+    "RUSTSEC-2017-0008",
+]
+
+[bans]
+# Warn (not deny) on duplicate versions: the pty feature's tree occasionally
+# pulls two minor versions transitively; surface it without blocking the build.
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal paneview crate is a path dep with version "0.1.0"; allow path deps so
+# any workspace wildcard is not flagged (external wildcards still denied).
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+version = 2
+# Permissive licenses only. Add here deliberately.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0", # unicode-ident (dual with MIT/Apache)
+]
+confidence-threshold = 0.9
