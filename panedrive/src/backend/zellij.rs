@@ -14,7 +14,6 @@
 use super::PaneBackend;
 use crate::key::{Key, ZellijKey};
 use std::io;
-use std::path::PathBuf;
 use std::process::Command;
 
 /// Drives the focused pane of one zellij session, addressed by session name.
@@ -54,22 +53,6 @@ impl ZellijBackend {
             argv.extend(action.args.iter().cloned());
         }
         argv
-    }
-
-    /// Where `capture` asks zellij to dump the screen: a temp path owned by this
-    /// process and session. The session name is reduced to filename-safe
-    /// characters so a name with a path separator cannot redirect the dump.
-    fn dump_path(&self) -> PathBuf {
-        let safe: String = self
-            .session
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        std::env::temp_dir().join(format!(
-            "panedrive-zellij-{}-{}.dump",
-            safe,
-            std::process::id()
-        ))
     }
 
     /// Run one planned action, surfacing a non-zero exit as an error naming the
@@ -127,16 +110,20 @@ impl PaneBackend for ZellijBackend {
     }
 
     fn capture(&self) -> io::Result<String> {
-        // `dump-screen` writes to a file rather than stdout, so dump to a temp
-        // path this process owns, read it, and remove it.
-        let path = self.dump_path();
-        self.run(&Action {
+        // `dump-screen` with no `--path` prints the viewport to stdout, so read
+        // it straight from the command's output, no temp file needed.
+        let action = Action {
             name: "dump-screen",
-            args: vec![path.to_string_lossy().into_owned()],
-        })?;
-        let contents = std::fs::read_to_string(&path)?;
-        let _ = std::fs::remove_file(&path);
-        Ok(contents)
+            args: Vec::new(),
+        };
+        let out = Command::new("zellij").args(self.argv(&action)).output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "zellij action dump-screen failed for session {} (is it running?)",
+                self.session
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -158,10 +145,6 @@ mod tests {
             z.argv(&action("write-chars", &["hi"])),
             vec!["--session=demo", "action", "write-chars", "--", "hi"]
         );
-        assert_eq!(
-            z.argv(&action("dump-screen", &["/tmp/x"])),
-            vec!["--session=demo", "action", "dump-screen", "--", "/tmp/x"]
-        );
     }
 
     #[test]
@@ -176,29 +159,12 @@ mod tests {
 
     #[test]
     fn argv_omits_the_separator_when_there_is_no_payload() {
+        // `dump-screen` prints to stdout with no positional path.
         let z = ZellijBackend::new("demo");
         assert_eq!(
             z.argv(&action("dump-screen", &[])),
             vec!["--session=demo", "action", "dump-screen"]
         );
-    }
-
-    #[test]
-    fn dump_path_is_session_scoped_and_in_temp() {
-        let p = ZellijBackend::new("demo").dump_path();
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("panedrive-zellij-demo-"), "got {name}");
-        assert!(name.ends_with(".dump"));
-        assert!(p.starts_with(std::env::temp_dir()));
-    }
-
-    #[test]
-    fn dump_path_sanitizes_a_session_with_a_path_separator() {
-        // A name with a slash must not turn the dump into a nested path.
-        let p = ZellijBackend::new("a/b").dump_path();
-        assert_eq!(p.parent().unwrap(), std::env::temp_dir());
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("panedrive-zellij-a_b-"), "got {name}");
     }
 
     #[test]
