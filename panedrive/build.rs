@@ -27,7 +27,18 @@ fn main() {
     };
     println!("cargo:rustc-env=PANEDRIVE_VERSION={version}");
 
-    // Refresh the embedded SHA when HEAD moves; harmless if .git is absent.
-    println!("cargo:rerun-if-changed=../.git/HEAD");
+    // Refresh the embedded SHA when the checked-out commit changes. On a branch,
+    // `.git/HEAD` is a `ref:` pointer that stays put across commits, so also
+    // watch the branch ref file it points at. All harmless if `.git` is absent.
+    let git_dir = std::path::Path::new("../.git");
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(reference) = head.strip_prefix("ref:").map(str::trim) {
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join(reference).display()
+            );
+        }
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }
