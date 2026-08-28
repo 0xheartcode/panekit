@@ -15,6 +15,15 @@ pub fn read_state_file(path: &Path) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Wrap a captured screen as a structured state value so conditions can run
+/// against an *uninstrumented* app: the whole text is at `screen`, and each row
+/// is at `lines.<n>`. Pairs with the `~=` (contains) condition, e.g.
+/// `screen~=Ready` or `lines.0~=Loading`.
+pub fn screen_state(text: &str) -> Value {
+    let lines: Vec<Value> = text.lines().map(|l| Value::String(l.to_string())).collect();
+    serde_json::json!({ "screen": text, "lines": lines })
+}
+
 /// Outcome of a [`wait_until`] loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
@@ -98,6 +107,17 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::cell::Cell;
+
+    #[test]
+    fn screen_state_exposes_the_text_and_its_lines() {
+        let v = screen_state("Loading...\nReady");
+        assert_eq!(v["screen"], "Loading...\nReady");
+        assert_eq!(v["lines"][0], "Loading...");
+        assert_eq!(v["lines"][1], "Ready");
+        // conditions run against it, so `screen~=Ready` and `lines.1=Ready` hold
+        assert!(Condition::parse("screen~=Ready").unwrap().eval(&v));
+        assert!(Condition::parse("lines.1=Ready").unwrap().eval(&v));
+    }
 
     #[test]
     fn satisfied_on_first_probe_does_not_wait() {

@@ -19,13 +19,13 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use panedrive::{
     Key, PaneBackend, RunResult, ScreenBackend, TmuxBackend, WaitOutcome, ZellijBackend,
-    condition::Condition, driver, key, parse_script, run_script,
+    condition::Condition, driver, key, parse_script, run_script_settling,
 };
 
 #[derive(Parser)]
 #[command(
     name = "panedrive",
-    version,
+    version = env!("PANEDRIVE_VERSION"),
     about = "Drive and verify terminal UIs headlessly (panekit)."
 )]
 struct Cli {
@@ -139,6 +139,14 @@ enum Cmd {
         /// pty only: columns of the spawned pseudo-terminal.
         #[arg(long, default_value_t = 80)]
         cols: u16,
+        /// After each key/type step, wait up to ~1s for the seam to change
+        /// before the next step, so an `assert` does not race a stale snapshot.
+        #[arg(long)]
+        settle: bool,
+        /// Evaluate conditions against the captured screen text (`screen`,
+        /// `lines.<n>`) instead of a JSON state file, for apps with no seam.
+        #[arg(long)]
+        from_capture: bool,
     },
 }
 
@@ -267,16 +275,25 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             program,
             rows,
             cols,
+            settle,
+            from_capture,
         } => {
             let text = std::fs::read_to_string(&script)
                 .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
             let steps = parse_script(&text)?;
             let backend = run_backend(backend, pane, program, rows, cols)?;
-            let probe = || match &state {
-                Some(path) => driver::read_state_file(path),
-                None => None,
+            let b: &dyn PaneBackend = backend.as_ref();
+            let settle = settle.then(|| Duration::from_millis(1000));
+            // Read state from the JSON seam, or, with --from-capture, from the
+            // pane's visible text wrapped as {screen, lines} for uninstrumented
+            // apps.
+            let mut probe: Box<dyn FnMut() -> Option<serde_json::Value>> = if from_capture {
+                Box::new(move || b.capture().ok().map(|text| driver::screen_state(&text)))
+            } else {
+                Box::new(move || state.as_deref().and_then(driver::read_state_file))
             };
-            let outcome = run_script(&steps, backend.as_ref(), probe, |screen| print!("{screen}"))?;
+            let outcome =
+                run_script_settling(&steps, b, settle, &mut probe, |screen| print!("{screen}"))?;
             match outcome {
                 RunResult::Passed => Ok(ExitCode::SUCCESS),
                 RunResult::Failed(why) => {

@@ -28,7 +28,10 @@ use crate::condition::Condition;
 use crate::driver::wait_until;
 use crate::key::{self, Key};
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long the `settle` poll waits between seam reads.
+const SETTLE_INTERVAL_MS: u64 = 20;
 
 const DEFAULT_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_INTERVAL_MS: u64 = 50;
@@ -125,6 +128,24 @@ pub fn parse_script(text: &str) -> anyhow::Result<Vec<Step>> {
 pub fn run_script<P, E>(
     steps: &[Step],
     backend: &dyn PaneBackend,
+    probe: P,
+    emit: E,
+) -> anyhow::Result<RunResult>
+where
+    P: FnMut() -> Option<Value>,
+    E: FnMut(&str),
+{
+    run_script_settling(steps, backend, None, probe, emit)
+}
+
+/// Like [`run_script`], but when `settle` is `Some(timeout)` each key/type step
+/// waits (up to `timeout`) for the seam to change before the next step. This
+/// absorbs the asynchronous gap between a keypress and the UI writing its next
+/// snapshot, so a following `assert` does not race a stale seam.
+pub fn run_script_settling<P, E>(
+    steps: &[Step],
+    backend: &dyn PaneBackend,
+    settle: Option<Duration>,
     mut probe: P,
     mut emit: E,
 ) -> anyhow::Result<RunResult>
@@ -135,7 +156,11 @@ where
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         match step {
-            Step::Press(keys) => backend.send_keys(keys)?,
+            Step::Press(keys) => {
+                let before = if settle.is_some() { probe() } else { None };
+                backend.send_keys(keys)?;
+                settle_after(settle, &before, &mut probe);
+            }
             Step::Type { source, paste } => {
                 let text = match source {
                     TypeSource::Literal(s) => s.clone(),
@@ -143,12 +168,14 @@ where
                         anyhow::anyhow!("step {n}: environment variable {var} is not set")
                     })?,
                 };
+                let before = if settle.is_some() { probe() } else { None };
                 if *paste {
                     backend.paste_text(&text)?;
                 } else {
                     let keys: Vec<Key> = text.chars().map(Key::Char).collect();
                     backend.send_keys(&keys)?;
                 }
+                settle_after(settle, &before, &mut probe);
             }
             Step::Sleep(d) => std::thread::sleep(*d),
             Step::Capture => emit(&backend.capture()?),
@@ -180,6 +207,25 @@ where
         }
     }
     Ok(RunResult::Passed)
+}
+
+/// After a mutating step, poll the seam until it differs from `before` (or the
+/// settle timeout elapses). A no-op when `settle` is `None`.
+fn settle_after<P>(settle: Option<Duration>, before: &Option<Value>, probe: &mut P)
+where
+    P: FnMut() -> Option<Value>,
+{
+    let Some(timeout) = settle else { return };
+    let start = Instant::now();
+    loop {
+        if probe().as_ref() != before.as_ref() {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(SETTLE_INTERVAL_MS));
+    }
 }
 
 /// `type <literal...>` | `type [--paste] --from-env VAR` | `type --paste <literal...>`.
@@ -539,6 +585,37 @@ mod tests {
             out.is_err(),
             "an unset env var must be an error, not a pass"
         );
+    }
+
+    #[test]
+    fn settle_waits_for_the_seam_to_change_before_the_next_step() {
+        use std::cell::Cell;
+        // The seam reads v=0 on the first probe (the pre-press snapshot) and
+        // v=1 afterwards, modelling the app writing its update slightly late.
+        let make_probe = || {
+            let n = Cell::new(0);
+            move || {
+                let i = n.get();
+                n.set(i + 1);
+                Some(json!({ "v": if i == 0 { 0 } else { 1 } }))
+            }
+        };
+        let steps = parse_script("press a\nassert v=1").unwrap();
+
+        // Without settle, the assert races and reads the stale v=0.
+        let out = run_script(&steps, &mock(), make_probe(), |_| {}).unwrap();
+        assert!(matches!(out, RunResult::Failed(_)), "no settle should race");
+
+        // With settle, the press waits for v to change, so the assert holds.
+        let out = run_script_settling(
+            &steps,
+            &mock(),
+            Some(Duration::from_secs(1)),
+            make_probe(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed, "settle should absorb the async gap");
     }
 
     #[test]
