@@ -9,12 +9,23 @@
 //! | `focus=fleet`     | the scalar at the path equals `fleet`            |
 //! | `open=true`       | booleans/numbers compare by their text form      |
 //! | `bag.count!=0`    | the path exists and its scalar differs           |
+//! | `bag.count>2`     | numeric compare (`>`, `<`, `>=`, `<=`)           |
+//! | `line~=Ready`     | the scalar at the path contains the substring    |
 //! | `rows.2=x`        | array indices are path segments                  |
 //!
 //! Scalars (string/bool/number/null) compare by their textual form; objects and
 //! arrays are not scalar and never equal a bare value.
 
 use serde_json::Value;
+
+/// A numeric comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumOp {
+    Gt,
+    Lt,
+    Ge,
+    Le,
+}
 
 /// A parsed condition over the state JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,21 +36,55 @@ pub enum Condition {
     Equals(String, String),
     /// The dot-path resolves to a scalar that differs from the given text.
     NotEquals(String, String),
+    /// The scalar at the dot-path contains the given substring.
+    Contains(String, String),
+    /// The numeric scalar at the dot-path compares to the given number.
+    Compare(String, NumOp, String),
 }
 
 impl Condition {
-    /// Parse a condition spec. `!=` binds before `=`; a trailing `?` (or no
-    /// operator at all) means existence.
+    /// Parse a condition spec. Operators are matched longest-first so `>=` binds
+    /// before `>` and `!=` / `~=` before `=`; a trailing `?` (or no operator at
+    /// all) means existence.
     pub fn parse(spec: &str) -> anyhow::Result<Condition> {
         let s = spec.trim();
-        if let Some((path, want)) = s.split_once("!=") {
-            return Ok(Condition::NotEquals(
+        // Order matters: two-char operators before their one-char prefixes.
+        if let Some((path, want)) = s.split_once(">=") {
+            return Ok(Condition::Compare(
                 clean_path(path),
-                want.trim().to_string(),
+                NumOp::Ge,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("<=") {
+            return Ok(Condition::Compare(
+                clean_path(path),
+                NumOp::Le,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("!=") {
+            return Ok(Condition::NotEquals(clean_path(path), want.trim().into()));
+        }
+        if let Some((path, want)) = s.split_once("~=") {
+            return Ok(Condition::Contains(clean_path(path), want.trim().into()));
+        }
+        if let Some((path, want)) = s.split_once('>') {
+            return Ok(Condition::Compare(
+                clean_path(path),
+                NumOp::Gt,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once('<') {
+            return Ok(Condition::Compare(
+                clean_path(path),
+                NumOp::Lt,
+                want.trim().into(),
             ));
         }
         if let Some((path, want)) = s.split_once('=') {
-            return Ok(Condition::Equals(clean_path(path), want.trim().to_string()));
+            return Ok(Condition::Equals(clean_path(path), want.trim().into()));
         }
         let path = clean_path(s.strip_suffix('?').unwrap_or(s));
         if path.is_empty() {
@@ -62,6 +107,26 @@ impl Condition {
                 Some(got) => !scalar_eq(&got, want),
                 None => false,
             },
+            Condition::Contains(path, want) => match scalar_at(root, path) {
+                Some(got) => got.contains(want.as_str()),
+                None => false,
+            },
+            // Both sides must be numeric and the path must exist; otherwise the
+            // comparison is unsatisfied rather than erroring.
+            Condition::Compare(path, op, want) => {
+                match (
+                    scalar_at(root, path).and_then(|g| g.parse::<f64>().ok()),
+                    want.parse::<f64>(),
+                ) {
+                    (Some(got), Ok(want)) => match op {
+                        NumOp::Gt => got > want,
+                        NumOp::Lt => got < want,
+                        NumOp::Ge => got >= want,
+                        NumOp::Le => got <= want,
+                    },
+                    _ => false,
+                }
+            }
         }
     }
 }
@@ -183,5 +248,52 @@ mod tests {
         assert!(!Condition::parse("bag.count!=2").unwrap().eval(&state()));
         // absent path is unsatisfied, not "not-equal"
         assert!(!Condition::parse("missing!=0").unwrap().eval(&state()));
+    }
+
+    #[test]
+    fn parse_matches_operators_longest_first() {
+        assert_eq!(
+            Condition::parse("bag.count>=2").unwrap(),
+            Condition::Compare("bag.count".into(), NumOp::Ge, "2".into())
+        );
+        assert_eq!(
+            Condition::parse("bag.count<=2").unwrap(),
+            Condition::Compare("bag.count".into(), NumOp::Le, "2".into())
+        );
+        assert_eq!(
+            Condition::parse("bag.count>1").unwrap(),
+            Condition::Compare("bag.count".into(), NumOp::Gt, "1".into())
+        );
+        assert_eq!(
+            Condition::parse("bag.count<9").unwrap(),
+            Condition::Compare("bag.count".into(), NumOp::Lt, "9".into())
+        );
+        assert_eq!(
+            Condition::parse("focus~=fle").unwrap(),
+            Condition::Contains("focus".into(), "fle".into())
+        );
+    }
+
+    #[test]
+    fn numeric_comparisons_need_both_sides_numeric_and_present() {
+        assert!(Condition::parse("bag.count>1").unwrap().eval(&state()));
+        assert!(Condition::parse("bag.count>=2").unwrap().eval(&state()));
+        assert!(!Condition::parse("bag.count>2").unwrap().eval(&state()));
+        assert!(Condition::parse("bag.count<3").unwrap().eval(&state()));
+        assert!(Condition::parse("bag.count<=2").unwrap().eval(&state()));
+        assert!(!Condition::parse("bag.count<2").unwrap().eval(&state()));
+        // non-numeric scalar or absent path is unsatisfied, never a panic
+        assert!(!Condition::parse("focus>1").unwrap().eval(&state()));
+        assert!(!Condition::parse("missing>1").unwrap().eval(&state()));
+    }
+
+    #[test]
+    fn contains_matches_substrings_of_the_scalar_text() {
+        assert!(Condition::parse("focus~=fle").unwrap().eval(&state()));
+        assert!(Condition::parse("focus~=fleet").unwrap().eval(&state()));
+        assert!(!Condition::parse("focus~=xyz").unwrap().eval(&state()));
+        // objects/arrays are not scalars, so contains is unsatisfied
+        assert!(!Condition::parse("bag~=count").unwrap().eval(&state()));
+        assert!(!Condition::parse("missing~=x").unwrap().eval(&state()));
     }
 }
