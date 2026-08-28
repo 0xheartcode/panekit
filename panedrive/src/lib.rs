@@ -16,10 +16,12 @@ pub mod backend;
 pub mod condition;
 pub mod driver;
 pub mod key;
+pub mod script;
 
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;
-pub use backend::{PaneBackend, tmux::TmuxBackend};
-pub use condition::Condition;
-pub use driver::{WaitOutcome, read_state_file, wait_until, watch};
-pub use key::{Key, TmuxKey, parse_keys};
+pub use backend::{PaneBackend, screen::ScreenBackend, tmux::TmuxBackend, zellij::ZellijBackend};
+pub use condition::{Condition, NumOp};
+pub use driver::{WaitOutcome, read_state_file, screen_state, wait_until, watch};
+pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
+pub use script::{RunResult, Step, TypeSource, parse_script, run_script, run_script_settling};

@@ -4,7 +4,9 @@
 //! backend-agnostic, so adding zellij or a raw PTY is one new impl of this
 //! trait, nothing else.
 
+pub mod screen;
 pub mod tmux;
+pub mod zellij;
 
 #[cfg(feature = "pty")]
 pub mod pty;

@@ -1,0 +1,18 @@
+# A sample panedrive script for the counter_tui example.
+#
+#   cargo build --example counter_tui
+#   panedrive run panedrive/examples/counter.pds \
+#     --backend pty --state counter.state.json \
+#     -- target/debug/examples/counter_tui counter.state.json
+#
+# Steps run top to bottom in one process; the run stops at the first failing
+# assert or wait-until. Exit 0 = all passed, 1 = a step failed, 2 = usage error.
+
+type inc
+press Enter
+wait-until count=1 --timeout-ms 2000
+type inc
+press Enter
+wait-until count=2 --timeout-ms 2000
+assert last=inc
+capture

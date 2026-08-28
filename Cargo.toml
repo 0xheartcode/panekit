@@ -3,7 +3,7 @@ resolver = "2"
 members = ["paneview", "panedrive"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 authors = ["0xheartcode"]
@@ -13,7 +13,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # internal
-paneview = { path = "paneview", version = "0.1.0" }
+paneview = { path = "paneview", version = "0.1.1" }
 
 # external
 serde = { version = "1", features = ["derive"] }

@@ -12,6 +12,10 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 
+# Build docs.rs with every feature so the pty backend's API is documented.
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "panedrive"
 path = "src/lib.rs"

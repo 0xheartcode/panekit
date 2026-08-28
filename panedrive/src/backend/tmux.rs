@@ -1,7 +1,7 @@
 //! The tmux backend: drives a pane via `tmux send-keys` and reads it via
 //! `tmux capture-pane`. Best for driving a *live* session a human may also be
-//! watching. (A dependency-free PTY backend for CI is planned, see the repo
-//! roadmap.)
+//! watching. For CI without a multiplexer, use the PTY backend (`PtyBackend`,
+//! behind the `pty` feature), which spawns the UI itself.
 
 use super::PaneBackend;
 use crate::key::{Key, TmuxKey};

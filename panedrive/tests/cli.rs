@@ -16,6 +16,13 @@ fn write_state(name: &str, json: &str) -> std::path::PathBuf {
     path
 }
 
+fn write_script(name: &str, body: &str) -> std::path::PathBuf {
+    let path =
+        std::env::temp_dir().join(format!("panedrive-cli-{}-{name}.pds", std::process::id()));
+    fs::write(&path, body).unwrap();
+    path
+}
+
 fn code(mut cmd: Command) -> i32 {
     cmd.status().unwrap().code().unwrap()
 }
@@ -78,6 +85,96 @@ fn bad_condition_is_a_usage_error_exit_2() {
     cmd.args(["assert", "", "--state"]).arg(&state); // empty condition
     assert_eq!(code(cmd), 2, "unparseable condition should exit 2");
     fs::remove_file(&state).ok();
+}
+
+#[test]
+fn run_maps_the_script_result_to_exit_codes() {
+    // `assert`/empty-step scripts read the state seam and never contact the
+    // backend, so a dummy `--pane` lets us exercise the whole exit contract
+    // headlessly, with no tmux pane in sight.
+    let state = write_state("run", r#"{ "focus": "fleet" }"#);
+
+    let empty = write_script("empty", "# nothing to do\n");
+    let mut pass_empty = bin();
+    pass_empty
+        .args(["run"])
+        .arg(&empty)
+        .args(["--backend", "tmux", "--pane", "dummy"]);
+    assert_eq!(code(pass_empty), 0, "an empty script passes");
+
+    let holds = write_script("holds", "assert focus=fleet\n");
+    let mut pass = bin();
+    pass.args(["run"])
+        .arg(&holds)
+        .args(["--backend", "tmux", "--pane", "dummy", "--state"])
+        .arg(&state);
+    assert_eq!(code(pass), 0, "a holding assert exits 0");
+
+    let fails = write_script("fails", "assert focus=nope\n");
+    let mut fail = bin();
+    fail.args(["run"])
+        .arg(&fails)
+        .args(["--backend", "tmux", "--pane", "dummy", "--state"])
+        .arg(&state);
+    assert_eq!(code(fail), 1, "a failing assert exits 1");
+
+    let bad = write_script("bad", "frobnicate\n");
+    let mut usage = bin();
+    usage
+        .args(["run"])
+        .arg(&bad)
+        .args(["--backend", "tmux", "--pane", "dummy"]);
+    assert_eq!(code(usage), 2, "an unparseable script is a usage error");
+
+    for f in [&state, &empty, &holds, &fails, &bad] {
+        fs::remove_file(f).ok();
+    }
+}
+
+#[test]
+fn run_reports_backend_selection_errors_as_exit_2() {
+    let script = write_script("sel", "press Enter\n");
+
+    // No --pane for an attach backend.
+    let mut no_pane = bin();
+    no_pane
+        .args(["run"])
+        .arg(&script)
+        .args(["--backend", "tmux"]);
+    assert_eq!(code(no_pane), 2, "tmux without --pane is a usage error");
+
+    // Without the `pty` feature the pty backend is not compiled in, so
+    // selecting it is a usage error. With the feature it actually spawns, so
+    // only assert the no-feature contract here.
+    if !cfg!(feature = "pty") {
+        let mut pty = bin();
+        pty.args(["run"])
+            .arg(&script)
+            .args(["--backend", "pty", "--", "true"]);
+        assert_eq!(code(pty), 2, "pty without the feature is a usage error");
+    }
+
+    // A missing script file cannot be read.
+    let mut missing = bin();
+    missing.args([
+        "run",
+        "/no/such/script.pds",
+        "--backend",
+        "tmux",
+        "--pane",
+        "x",
+    ]);
+    assert_eq!(code(missing), 2, "a missing script is a usage error");
+
+    fs::remove_file(&script).ok();
+}
+
+#[test]
+fn pty_backend_is_rejected_for_one_shot_commands() {
+    // The pty backend spawns a program, so it is only valid via `run`.
+    let mut cmd = bin();
+    cmd.args(["press", "Enter", "--pane", "x", "--backend", "pty"]);
+    assert_eq!(code(cmd), 2, "pty on a one-shot command is a usage error");
 }
 
 #[test]

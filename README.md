@@ -1,12 +1,51 @@
 # 🖥️ panekit
 
+[![paneview on crates.io](https://img.shields.io/crates/v/paneview.svg?label=paneview)](https://crates.io/crates/paneview)
+[![panedrive on crates.io](https://img.shields.io/crates/v/panedrive.svg?label=panedrive)](https://crates.io/crates/panedrive)
+[![docs.rs](https://img.shields.io/docsrs/paneview?label=docs.rs)](https://docs.rs/paneview)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Drive and verify terminal UIs headlessly**, so an agent (or a test, or CI) can
 operate a TUI the way a user does: press real keys, then read real state.
 
-> **Status:** v0.1.0, working and unpublished. Two backends are proven live: tmux
-> (attach to a running pane) and PTY (spawn a TUI with no multiplexer, behind the
-> `pty` feature). The state seam and condition engine are covered at ~90%, and the
-> CLI's exit-code contract is integration-tested.
+> **Status:** v0.1.0, published on [crates.io](https://crates.io/crates/panedrive).
+> Two backends are proven live: tmux (attach to a running pane) and PTY (spawn a
+> TUI with no multiplexer, behind the `pty` feature). The state seam and condition
+> engine are covered at ~90%, and the CLI's exit-code contract is
+> integration-tested.
+
+## Install
+
+```bash
+cargo install panedrive          # the driver CLI (tmux backend)
+cargo install panedrive --features pty   # add the PTY backend
+cargo add paneview               # the state seam, in your UI's crate
+```
+
+## Try it in a minute
+
+The repo ships a tiny `counter_tui` example whose seam is
+`{ "count": <n>, "last": <cmd>, "ready": <bool> }`. Drive it headlessly with a
+script, no terminal to watch:
+
+```bash
+git clone https://github.com/0xheartcode/panekit && cd panekit
+cargo build -p panedrive --features pty --example counter_tui
+
+# spawn the TUI in a PTY, type two `inc` commands, wait for the seam to catch up
+panedrive run panedrive/examples/counter.pds \
+  --backend pty --state /tmp/counter.state.json \
+  -- ./target/debug/examples/counter_tui /tmp/counter.state.json
+
+echo $?                      # 0: every step passed
+cat /tmp/counter.state.json  # {"count":2,"last":"inc","ready":true}
+```
+
+Nothing here is counter-specific: the seam is whatever JSON *your* UI puts in
+`dump_state`, and conditions are dot-paths into it. Watch a clock field tick,
+gate on `queue.len!=0`, assert `date=2026-08-28`, or check a nested
+`rows.2.status=done`; the driver only reads JSON, so it works the same for any
+shape of state.
 
 ## Why this exists
 
@@ -53,6 +92,10 @@ impl DumpState for App {
 write_snapshot(&app, std::path::Path::new("run.state.json"))?;
 ```
 
+Not a Rust UI? The seam is just a JSON file, so any language can expose one by
+writing the same shape (atomically). See [`docs/SEAM.md`](docs/SEAM.md) for the
+one-page contract and Go/Python/JS adapters.
+
 **2. Drive it** (`panedrive`), from a shell or an agent:
 
 ```bash
@@ -76,6 +119,48 @@ panedrive watch --state run.state.json --for-ms 10000 --interval-ms 200 --distin
 Exit codes: `0` success or held, `1` condition failed or timed out, `2` usage or
 backend error.
 
+### Scripts (`run`)
+
+For a whole flow in one process, put the steps in a file (one per line; `#`
+comments allowed) and `run` it:
+
+```text
+# login.pds
+type inc
+press Enter
+wait-until count=1 --timeout-ms 2000
+assert last=inc
+capture
+```
+
+```bash
+# attach to a running pane (tmux, zellij, or screen)
+panedrive run login.pds --backend tmux --pane mysession:1.0 --state run.state.json
+
+# or spawn the program yourself in a PTY (no multiplexer, ideal for CI)
+panedrive run login.pds --backend pty --state run.state.json -- ./my-tui --flag
+```
+
+Steps: `press <keys>`, `type <text>` (also `type --from-env VAR` and
+`type --paste ...` for secrets, see below), `wait-until <cond> [--timeout-ms N]
+[--interval-ms N]`, `assert <cond>`, `capture`, `sleep <200ms|1s|N>`. The run
+stops at the first failing `assert`/`wait-until` and maps to the same exit codes
+(`0` all passed, `1` a step failed, `2` usage or backend error). `run` is the
+only way to drive the **PTY** backend from the CLI, because that backend spawns
+and owns the target program, so it must live for the whole script.
+
+After a key that *changes* state, `wait-until` the new state rather than
+`assert` it immediately: the UI writes its next snapshot asynchronously, so an
+`assert` right after a `press` can read the pre-change seam. Use `assert` for
+state that has already settled. Or pass **`--settle`** to `run`, and every
+key/type step waits (up to ~1s) for the seam to change before the next step, so
+you can `assert` right after a `press` without the race.
+
+No seam to read? **`run --from-capture`** evaluates conditions against the
+captured screen text instead of a state file (`screen` is the whole screen,
+`lines.<n>` each row), so `wait-until "screen~=Ready" --from-capture` drives an
+uninstrumented app. Less precise than a real seam, but it degrades gracefully.
+
 ### Conditions
 
 `wait-until` / `assert` take a tiny expression over the state JSON:
@@ -86,6 +171,8 @@ backend error.
 | `focus=fleet` | scalar at the path equals `fleet` |
 | `open=true` | booleans/numbers compare by text |
 | `bag.count!=0` | path exists and its scalar differs |
+| `bag.count>2` | numeric compare (`>`, `<`, `>=`, `<=`) |
+| `line~=Ready` | the scalar contains the substring |
 | `rows.2=x` | array indices are path segments |
 
 Equality is numeric-aware: `count=2` matches a JSON `2` or `2.0` (and `1e3`
@@ -101,6 +188,16 @@ read -rs VAULT_PASS
 printf %s "$VAULT_PASS" | panedrive type --stdin --pane mysession:1.0
 # or
 panedrive type --from-env VAULT_PASS --pane mysession:1.0
+```
+
+Inside a `run` script the same is available, so a scripted login never puts the
+secret in the script file:
+
+```text
+# login.pds
+wait-until prompt=password
+type --from-env VAULT_PASS      # or: type --paste --from-env VAULT_PASS
+press Enter
 ```
 
 Transport matters too, not just the source:
@@ -124,12 +221,17 @@ host-specific part:
 
 - **tmux** (default): best for a live session a human may also be watching.
   Attaches to an already-running pane.
+- **zellij** (`ZellijBackend`): attaches to a running zellij session, driving it
+  with `action write-chars` / `write` and reading it with `dump-screen`. The
+  `--pane` value is the session name.
+- **GNU screen** (`ScreenBackend`): attaches to a running screen session, driving
+  it with `-X stuff` and reading it with `-X hardcopy`. The `--pane` value is the
+  session name.
 - **PTY** (behind the `pty` feature, `PtyBackend`): *spawns* the TUI in a
   pseudo-terminal this process owns and parses its screen with `vt100`. No
-  multiplexer needed, so it suits CI and in-process `cargo test`. It is a library
-  API (spawn/drive/assert/kill), not the one-shot CLI.
-- **zellij**: planned (`action write` + `action dump-screen`), one more impl of
-  the same trait.
+  multiplexer needed, so it suits CI and in-process `cargo test`. Drive it from
+  the CLI with `run ... --backend pty -- <program>`, or as a library API
+  (spawn/drive/assert/kill).
 
 Reading state via the JSON seam is backend-independent, so most driving does not
 depend on which host you use.
