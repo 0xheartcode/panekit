@@ -12,6 +12,10 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 
+# Build docs.rs with every feature, for parity with the driver crate.
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
