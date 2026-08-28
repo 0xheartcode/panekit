@@ -19,8 +19,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install multiplexers (tmux, screen, zellij)
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux screen
+          # zellij has no apt package; pull the static release binary.
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /usr/local/bin zellij
+          tmux -V && screen --version | head -1 && zellij --version
 
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
