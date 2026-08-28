@@ -1,12 +1,26 @@
 # 🖥️ panekit
 
+[![paneview on crates.io](https://img.shields.io/crates/v/paneview.svg?label=paneview)](https://crates.io/crates/paneview)
+[![panedrive on crates.io](https://img.shields.io/crates/v/panedrive.svg?label=panedrive)](https://crates.io/crates/panedrive)
+[![docs.rs](https://img.shields.io/docsrs/paneview?label=docs.rs)](https://docs.rs/paneview)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Drive and verify terminal UIs headlessly**, so an agent (or a test, or CI) can
 operate a TUI the way a user does: press real keys, then read real state.
 
-> **Status:** v0.1.0, working and unpublished. Two backends are proven live: tmux
-> (attach to a running pane) and PTY (spawn a TUI with no multiplexer, behind the
-> `pty` feature). The state seam and condition engine are covered at ~90%, and the
-> CLI's exit-code contract is integration-tested.
+> **Status:** v0.1.0, published on [crates.io](https://crates.io/crates/panedrive).
+> Two backends are proven live: tmux (attach to a running pane) and PTY (spawn a
+> TUI with no multiplexer, behind the `pty` feature). The state seam and condition
+> engine are covered at ~90%, and the CLI's exit-code contract is
+> integration-tested.
+
+## Install
+
+```bash
+cargo install panedrive          # the driver CLI (tmux backend)
+cargo install panedrive --features pty   # add the PTY backend
+cargo add paneview               # the state seam, in your UI's crate
+```
 
 ## Why this exists
 
@@ -76,6 +90,35 @@ panedrive watch --state run.state.json --for-ms 10000 --interval-ms 200 --distin
 Exit codes: `0` success or held, `1` condition failed or timed out, `2` usage or
 backend error.
 
+### Scripts (`run`)
+
+For a whole flow in one process, put the steps in a file (one per line; `#`
+comments allowed) and `run` it:
+
+```text
+# login.pds
+type inc
+press Enter
+wait-until count=1 --timeout-ms 2000
+assert last=inc
+capture
+```
+
+```bash
+# attach to a running pane (tmux or zellij)
+panedrive run login.pds --backend tmux --pane mysession:1.0 --state run.state.json
+
+# or spawn the program yourself in a PTY (no multiplexer, ideal for CI)
+panedrive run login.pds --backend pty --state run.state.json -- ./my-tui --flag
+```
+
+Steps: `press <keys>`, `type <text>`, `wait-until <cond> [--timeout-ms N]
+[--interval-ms N]`, `assert <cond>`, `capture`, `sleep <200ms|1s|N>`. The run
+stops at the first failing `assert`/`wait-until` and maps to the same exit codes
+(`0` all passed, `1` a step failed, `2` usage or backend error). `run` is the
+only way to drive the **PTY** backend from the CLI, because that backend spawns
+and owns the target program, so it must live for the whole script.
+
 ### Conditions
 
 `wait-until` / `assert` take a tiny expression over the state JSON:
@@ -124,12 +167,14 @@ host-specific part:
 
 - **tmux** (default): best for a live session a human may also be watching.
   Attaches to an already-running pane.
+- **zellij** (`ZellijBackend`): attaches to a running zellij session, driving it
+  with `action write-chars` / `write` and reading it with `dump-screen`. The
+  `--pane` value is the session name.
 - **PTY** (behind the `pty` feature, `PtyBackend`): *spawns* the TUI in a
   pseudo-terminal this process owns and parses its screen with `vt100`. No
-  multiplexer needed, so it suits CI and in-process `cargo test`. It is a library
-  API (spawn/drive/assert/kill), not the one-shot CLI.
-- **zellij**: planned (`action write` + `action dump-screen`), one more impl of
-  the same trait.
+  multiplexer needed, so it suits CI and in-process `cargo test`. Drive it from
+  the CLI with `run ... --backend pty -- <program>`, or as a library API
+  (spawn/drive/assert/kill).
 
 Reading state via the JSON seam is backend-independent, so most driving does not
 depend on which host you use.
