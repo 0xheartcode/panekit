@@ -359,10 +359,27 @@ fn spawn_pty(program: Vec<String>, rows: u16, cols: u16) -> anyhow::Result<Box<d
             "the pty backend needs a program after `--`, e.g. `run s --backend pty -- mytui`"
         )
     })?;
+    // The PTY host resolves a bare program name through PATH but, unlike
+    // std::process, does not resolve a cwd-relative path (`./mytui`,
+    // `target/debug/mytui`). Canonicalize a path-like program so it works the
+    // way a shell user expects; leave bare names for the PATH lookup.
+    let prog = resolve_pty_program(prog);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     Ok(Box::new(panedrive::PtyBackend::spawn(
-        prog, &arg_refs, rows, cols,
+        &prog, &arg_refs, rows, cols,
     )?))
+}
+
+/// Resolve a cwd-relative, path-like program to an absolute path. A bare name
+/// (no separator) is returned unchanged so the PTY host can search PATH.
+#[cfg(feature = "pty")]
+fn resolve_pty_program(prog: &str) -> String {
+    if prog.contains(std::path::MAIN_SEPARATOR) {
+        if let Ok(abs) = std::fs::canonicalize(prog) {
+            return abs.to_string_lossy().into_owned();
+        }
+    }
+    prog.to_string()
 }
 
 #[cfg(not(feature = "pty"))]
@@ -372,4 +389,31 @@ fn spawn_pty(
     _cols: u16,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     anyhow::bail!("the pty backend requires building panedrive with `--features pty`")
+}
+
+#[cfg(all(test, feature = "pty"))]
+mod pty_program_tests {
+    use super::resolve_pty_program;
+
+    #[test]
+    fn bare_name_is_left_for_path_lookup() {
+        assert_eq!(resolve_pty_program("mytui"), "mytui");
+    }
+
+    #[test]
+    fn path_like_existing_program_becomes_absolute() {
+        let f = std::env::temp_dir().join(format!("panedrive-resolve-{}", std::process::id()));
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        let got = resolve_pty_program(&f.to_string_lossy());
+        assert!(
+            std::path::Path::new(&got).is_absolute(),
+            "path-like program should resolve to an absolute path, got {got}"
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn missing_path_like_program_is_left_unchanged() {
+        assert_eq!(resolve_pty_program("./no/such/prog"), "./no/such/prog");
+    }
 }
