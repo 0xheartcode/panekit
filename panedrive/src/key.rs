@@ -29,6 +29,18 @@ pub enum TmuxKey {
     Literal(char),
 }
 
+/// How a [`Key`] is handed to `zellij action`: printable characters go through
+/// `write-chars` (a literal string), everything else through `write` as the raw
+/// terminal byte sequence (the same bytes [`Key::to_bytes`] produces).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZellijKey {
+    /// A literal character, delivered with `zellij action write-chars`.
+    Chars(char),
+    /// The raw bytes of a named/control key, delivered with `zellij action
+    /// write <byte>...` (each byte as a decimal argument).
+    Bytes(Vec<u8>),
+}
+
 impl Key {
     /// Parse one token from the human spec.
     ///
@@ -98,6 +110,16 @@ impl Key {
             Key::Ctrl(c) => TmuxKey::Named(format!("C-{c}")),
         }
     }
+
+    /// Translate to the `zellij action` representation. Printable characters
+    /// become a `write-chars` literal; named and control keys become the raw
+    /// byte sequence [`Key::to_bytes`] produces, delivered with `write`.
+    pub fn to_zellij(&self) -> ZellijKey {
+        match self {
+            Key::Char(c) => ZellijKey::Chars(*c),
+            other => ZellijKey::Bytes(other.to_bytes()),
+        }
+    }
 }
 
 fn exactly_one_char(s: &str) -> Option<char> {
@@ -151,6 +173,19 @@ mod tests {
         assert_eq!(Key::Enter.to_tmux(), TmuxKey::Named("Enter".into()));
         assert_eq!(Key::Esc.to_tmux(), TmuxKey::Named("Escape".into()));
         assert_eq!(Key::Ctrl('c').to_tmux(), TmuxKey::Named("C-c".into()));
+    }
+
+    #[test]
+    fn zellij_encoding_splits_chars_from_raw_bytes() {
+        assert_eq!(Key::Char('a').to_zellij(), ZellijKey::Chars('a'));
+        assert_eq!(Key::Char('é').to_zellij(), ZellijKey::Chars('é'));
+        assert_eq!(Key::Enter.to_zellij(), ZellijKey::Bytes(vec![b'\r']));
+        assert_eq!(Key::Esc.to_zellij(), ZellijKey::Bytes(vec![0x1b]));
+        assert_eq!(
+            Key::Up.to_zellij(),
+            ZellijKey::Bytes(vec![0x1b, b'[', b'A'])
+        );
+        assert_eq!(Key::Ctrl('c').to_zellij(), ZellijKey::Bytes(vec![0x03]));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! trait, nothing else.
 
 pub mod tmux;
+pub mod zellij;
 
 #[cfg(feature = "pty")]
 pub mod pty;
