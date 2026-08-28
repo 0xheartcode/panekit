@@ -12,9 +12,12 @@ Both crates (`paneview` and `panedrive`) share one version and are released toge
 
 ### Added
 
-- **zellij backend** (`ZellijBackend`): a third `PaneBackend` that attaches to a
+- **zellij backend** (`ZellijBackend`): a `PaneBackend` that attaches to a
   running zellij session, driving it with `zellij action write-chars` / `write`
   and reading it with `dump-screen`. The `--pane` value is the session name.
+- **GNU screen backend** (`ScreenBackend`): a `PaneBackend` that attaches to a
+  running screen session via `-X stuff` and reads it via `-X hardcopy`. The
+  `--pane` value is the session name.
 - **`panedrive run <script>`**: a step-runner that executes a line-oriented
   script (`press`, `type`, `wait-until`, `assert`, `capture`, `sleep`) against
   one backend in a single process. This is what lets the CLI drive the **PTY**

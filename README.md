@@ -130,7 +130,7 @@ capture
 ```
 
 ```bash
-# attach to a running pane (tmux or zellij)
+# attach to a running pane (tmux, zellij, or screen)
 panedrive run login.pds --backend tmux --pane mysession:1.0 --state run.state.json
 
 # or spawn the program yourself in a PTY (no multiplexer, ideal for CI)
@@ -195,6 +195,9 @@ host-specific part:
 - **zellij** (`ZellijBackend`): attaches to a running zellij session, driving it
   with `action write-chars` / `write` and reading it with `dump-screen`. The
   `--pane` value is the session name.
+- **GNU screen** (`ScreenBackend`): attaches to a running screen session, driving
+  it with `-X stuff` and reading it with `-X hardcopy`. The `--pane` value is the
+  session name.
 - **PTY** (behind the `pty` feature, `PtyBackend`): *spawns* the TUI in a
   pseudo-terminal this process owns and parses its screen with `vt100`. No
   multiplexer needed, so it suits CI and in-process `cargo test`. Drive it from
