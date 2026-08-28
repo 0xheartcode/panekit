@@ -11,6 +11,8 @@
 //! |----------------------------------------|-----------------------------------|
 //! | `press 2 Down Enter`                   | send those keys                   |
 //! | `type hello world`                     | type the literal rest of the line |
+//! | `type --from-env VAULT_PASS`           | type a secret from an env var     |
+//! | `type --paste --from-env VAULT_PASS`   | same, via the paste transport     |
 //! | `wait-until count=1 --timeout-ms 2000` | poll the seam until it holds      |
 //! | `assert focus=fleet`                   | check the seam once               |
 //! | `capture`                              | emit the pane's visible text      |
@@ -35,7 +37,12 @@ const DEFAULT_INTERVAL_MS: u64 = 50;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Press(Vec<Key>),
-    Type(String),
+    Type {
+        source: TypeSource,
+        /// Route through the backend's paste transport (tmux buffer) instead of
+        /// keystrokes, so a secret never transits `send-keys` argv.
+        paste: bool,
+    },
     WaitUntil {
         cond: Condition,
         timeout: Duration,
@@ -44,6 +51,16 @@ pub enum Step {
     Assert(Condition),
     Capture,
     Sleep(Duration),
+}
+
+/// Where a `type` step gets its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeSource {
+    /// A literal string from the script line.
+    Literal(String),
+    /// The value of an environment variable, resolved at run time so the secret
+    /// is never baked into the parsed script.
+    FromEnv(String),
 }
 
 /// The result of running a whole script.
@@ -77,8 +94,7 @@ impl Step {
                 }
                 Step::Press(keys)
             }
-            // The rest of the line is the literal text, all whitespace included.
-            "type" => Step::Type(rest.to_string()),
+            "type" => parse_type(rest)?,
             "capture" => Step::Capture,
             "sleep" => Step::Sleep(parse_duration(rest)?),
             "wait-until" => parse_wait_until(rest)?,
@@ -120,9 +136,19 @@ where
         let n = i + 1;
         match step {
             Step::Press(keys) => backend.send_keys(keys)?,
-            Step::Type(text) => {
-                let keys: Vec<Key> = text.chars().map(Key::Char).collect();
-                backend.send_keys(&keys)?;
+            Step::Type { source, paste } => {
+                let text = match source {
+                    TypeSource::Literal(s) => s.clone(),
+                    TypeSource::FromEnv(var) => std::env::var(var).map_err(|_| {
+                        anyhow::anyhow!("step {n}: environment variable {var} is not set")
+                    })?,
+                };
+                if *paste {
+                    backend.paste_text(&text)?;
+                } else {
+                    let keys: Vec<Key> = text.chars().map(Key::Char).collect();
+                    backend.send_keys(&keys)?;
+                }
             }
             Step::Sleep(d) => std::thread::sleep(*d),
             Step::Capture => emit(&backend.capture()?),
@@ -154,6 +180,58 @@ where
         }
     }
     Ok(RunResult::Passed)
+}
+
+/// `type <literal...>` | `type [--paste] --from-env VAR` | `type --paste <literal...>`.
+///
+/// Flags are recognized only when the first token is `--paste` or `--from-env`;
+/// otherwise the whole remainder (leading and trailing whitespace included) is
+/// literal text, so ordinary `type` keeps its verbatim behavior.
+fn parse_type(rest: &str) -> anyhow::Result<Step> {
+    let trimmed = rest.trim_start();
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    if first != "--paste" && first != "--from-env" {
+        return Ok(Step::Type {
+            source: TypeSource::Literal(rest.to_string()),
+            paste: false,
+        });
+    }
+
+    let mut paste = false;
+    let mut from_env: Option<String> = None;
+    let mut tokens = trimmed.split_whitespace().peekable();
+    while let Some(&tok) = tokens.peek() {
+        match tok {
+            "--paste" => {
+                paste = true;
+                tokens.next();
+            }
+            "--from-env" => {
+                tokens.next();
+                let var = tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("type --from-env needs a variable name"))?;
+                from_env = Some(var.to_string());
+            }
+            _ => break,
+        }
+    }
+    let remainder: Vec<&str> = tokens.collect();
+    let source = match from_env {
+        Some(var) => {
+            if !remainder.is_empty() {
+                anyhow::bail!("type --from-env takes no literal text");
+            }
+            TypeSource::FromEnv(var)
+        }
+        None => {
+            if remainder.is_empty() {
+                anyhow::bail!("type --paste needs literal text or --from-env VAR");
+            }
+            TypeSource::Literal(remainder.join(" "))
+        }
+    };
+    Ok(Step::Type { source, paste })
 }
 
 /// `wait-until <cond> [--timeout-ms N] [--interval-ms N]`.
@@ -239,7 +317,10 @@ mod tests {
         );
         assert_eq!(
             Step::parse("type hello world").unwrap().unwrap(),
-            Step::Type("hello world".to_string())
+            Step::Type {
+                source: TypeSource::Literal("hello world".to_string()),
+                paste: false,
+            }
         );
         assert_eq!(Step::parse("capture").unwrap().unwrap(), Step::Capture);
         assert_eq!(
@@ -307,12 +388,56 @@ mod tests {
     fn type_preserves_leading_and_trailing_whitespace() {
         assert_eq!(
             Step::parse("type   x").unwrap().unwrap(),
-            Step::Type("  x".to_string())
+            Step::Type {
+                source: TypeSource::Literal("  x".to_string()),
+                paste: false,
+            }
         );
         assert_eq!(
             Step::parse("type foo ").unwrap().unwrap(),
-            Step::Type("foo ".to_string())
+            Step::Type {
+                source: TypeSource::Literal("foo ".to_string()),
+                paste: false,
+            }
         );
+    }
+
+    #[test]
+    fn type_parses_secret_and_paste_flags() {
+        assert_eq!(
+            Step::parse("type --from-env VAULT_PASS").unwrap().unwrap(),
+            Step::Type {
+                source: TypeSource::FromEnv("VAULT_PASS".to_string()),
+                paste: false,
+            }
+        );
+        assert_eq!(
+            Step::parse("type --paste --from-env VAULT_PASS")
+                .unwrap()
+                .unwrap(),
+            Step::Type {
+                source: TypeSource::FromEnv("VAULT_PASS".to_string()),
+                paste: true,
+            }
+        );
+        assert_eq!(
+            Step::parse("type --paste hi there").unwrap().unwrap(),
+            Step::Type {
+                source: TypeSource::Literal("hi there".to_string()),
+                paste: true,
+            }
+        );
+        // A literal that merely starts like a flag word is still literal.
+        assert_eq!(
+            Step::parse("type --pastel colour").unwrap().unwrap(),
+            Step::Type {
+                source: TypeSource::Literal("--pastel colour".to_string()),
+                paste: false,
+            }
+        );
+        assert!(Step::parse("type --from-env").is_err());
+        assert!(Step::parse("type --from-env VAR trailing").is_err());
+        assert!(Step::parse("type --paste").is_err());
     }
 
     #[test]
@@ -328,9 +453,11 @@ mod tests {
         assert!(err.contains("line 4"), "got: {err}");
     }
 
-    /// Records the keys and captures it was asked for; returns scripted screens.
+    /// Records the keys, pastes, and captures it was asked for; returns scripted
+    /// screens.
     struct MockBackend {
         sent: RefCell<Vec<Key>>,
+        pasted: RefCell<Vec<String>>,
         screen: String,
     }
 
@@ -342,11 +469,16 @@ mod tests {
         fn capture(&self) -> io::Result<String> {
             Ok(self.screen.clone())
         }
+        fn paste_text(&self, text: &str) -> io::Result<()> {
+            self.pasted.borrow_mut().push(text.to_string());
+            Ok(())
+        }
     }
 
     fn mock() -> MockBackend {
         MockBackend {
             sent: RefCell::new(Vec::new()),
+            pasted: RefCell::new(Vec::new()),
             screen: "SCREEN".to_string(),
         }
     }
@@ -369,6 +501,44 @@ mod tests {
             vec![Key::Char('a'), Key::Char('h'), Key::Char('i')]
         );
         assert_eq!(captured, vec!["SCREEN".to_string()]);
+    }
+
+    #[test]
+    fn run_types_a_secret_from_env_and_can_paste_it() {
+        // SAFETY: single-threaded test; the var is set and read within it.
+        unsafe {
+            std::env::set_var("PANEDRIVE_TEST_SECRET", "s3cr3t");
+        }
+        // keystroke path: chars are sent one by one
+        let keyed = mock();
+        let steps = parse_script("type --from-env PANEDRIVE_TEST_SECRET").unwrap();
+        run_script(&steps, &keyed, || None, |_| {}).unwrap();
+        assert_eq!(
+            *keyed.sent.borrow(),
+            "s3cr3t".chars().map(Key::Char).collect::<Vec<_>>()
+        );
+        assert!(keyed.pasted.borrow().is_empty());
+
+        // paste path: routed through paste_text, not send_keys
+        let pasted = mock();
+        let steps = parse_script("type --paste --from-env PANEDRIVE_TEST_SECRET").unwrap();
+        run_script(&steps, &pasted, || None, |_| {}).unwrap();
+        assert_eq!(*pasted.pasted.borrow(), vec!["s3cr3t".to_string()]);
+        assert!(pasted.sent.borrow().is_empty());
+
+        unsafe {
+            std::env::remove_var("PANEDRIVE_TEST_SECRET");
+        }
+    }
+
+    #[test]
+    fn run_errors_when_the_secret_env_var_is_unset() {
+        let steps = parse_script("type --from-env PANEDRIVE_DEFINITELY_UNSET").unwrap();
+        let out = run_script(&steps, &mock(), || None, |_| {});
+        assert!(
+            out.is_err(),
+            "an unset env var must be an error, not a pass"
+        );
     }
 
     #[test]
