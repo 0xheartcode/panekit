@@ -55,19 +55,13 @@ fn driving_a_missing_session_is_a_clean_error() {
     );
 }
 
-/// Live happy-path drive of a real zellij session. Bootstrapping a headless
-/// zellij under `script(1)` is environment-sensitive (server startup, the
-/// detached PTY host, and its `sleep`-fed stdin do not tear down cleanly on
-/// every runner), so this is **opt-in**: it runs only when `PANEKIT_LIVE_ZELLIJ`
-/// is set, keeping the deterministic gate stable. Run it locally with
-/// `PANEKIT_LIVE_ZELLIJ=1 cargo test --test zellij_roundtrip`. The deterministic
-/// error-path test above always runs and covers the backend's command path.
+/// Live happy-path drive of a real zellij session. zellij needs a real terminal
+/// to start, so it is hosted under `script(1)` (which provides a PTY) and driven
+/// from outside. The bootstrap is best-effort: if a session never registers the
+/// test skips rather than failing, so a constrained runner cannot flake the
+/// gate; when the session does come up it asserts the drive for real.
 #[test]
 fn drives_a_live_session_end_to_end() {
-    if std::env::var_os("PANEKIT_LIVE_ZELLIJ").is_none() {
-        eprintln!("skipping: set PANEKIT_LIVE_ZELLIJ=1 to run the live zellij happy-path");
-        return;
-    }
     if !zellij_available() || !script_available() {
         eprintln!("skipping: zellij or script(1) not installed");
         return;
@@ -101,6 +95,17 @@ fn drives_a_live_session_end_to_end() {
     let mut result = None;
     if up {
         let backend = ZellijBackend::new(&session);
+        // On a fresh install zellij shows a one-time "What's new?" welcome modal
+        // that captures keyboard input, so keys would go to the modal, not the
+        // shell. Dismiss it with Esc (its own hint) before driving.
+        for _ in 0..15 {
+            let screen = backend.capture().unwrap_or_default();
+            if !screen.contains("welcome to Zellij") && !screen.contains("What's new") {
+                break;
+            }
+            let _ = backend.send_keys(&parse_keys("Esc").unwrap());
+            std::thread::sleep(Duration::from_millis(200));
+        }
         // Type a token at the shell and press Enter; the shell echoes it back.
         let _ = backend.send_keys(&parse_keys("Z J T O K E N Enter").unwrap());
         // Poll the dump until the token appears (echoed on the command line).
