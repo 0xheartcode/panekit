@@ -40,7 +40,8 @@ Both crates (`paneview` and `panedrive`) share one version and are released toge
 - **Cross-language seam spec** (`docs/SEAM.md`): the one-page JSON-file contract
   plus Rust/Go/Python/JS adapters, since the driver is language-agnostic.
 - **Build metadata in `--version`**: `panedrive --version` now reports the git
-  short-SHA and commit date (e.g. `0.1.1 (a1b2c3d4e5 2026-08-28)`), with a clean
+  short-SHA and commit timestamp (e.g. `0.1.1 (a1b2c3d4e5 2026-08-28T12:21:14Z)`);
+  the timestamp is the commit time, so it stays deterministic, with a clean
   fallback to the bare version when built without git.
 - `CHANGELOG.md` following Keep a Changelog.
 - `docs.rs` metadata to build both crates with all features.
