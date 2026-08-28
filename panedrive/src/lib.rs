@@ -20,7 +20,7 @@ pub mod script;
 
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;
-pub use backend::{PaneBackend, tmux::TmuxBackend, zellij::ZellijBackend};
+pub use backend::{PaneBackend, screen::ScreenBackend, tmux::TmuxBackend, zellij::ZellijBackend};
 pub use condition::Condition;
 pub use driver::{WaitOutcome, read_state_file, wait_until, watch};
 pub use key::{Key, TmuxKey, ZellijKey, parse_keys};

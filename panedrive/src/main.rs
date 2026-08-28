@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use panedrive::{
-    Key, PaneBackend, RunResult, TmuxBackend, WaitOutcome, ZellijBackend, condition::Condition,
-    driver, key, parse_script, run_script,
+    Key, PaneBackend, RunResult, ScreenBackend, TmuxBackend, WaitOutcome, ZellijBackend,
+    condition::Condition, driver, key, parse_script, run_script,
 };
 
 #[derive(Parser)]
@@ -149,6 +149,9 @@ enum Backend {
     /// Attach to a running zellij session (the `--pane` value is the session
     /// name).
     Zellij,
+    /// Attach to a running GNU screen session (the `--pane` value is the session
+    /// name).
+    Screen,
     /// Spawn the program in an owned PTY. Only valid for `run` (which supplies
     /// the program after `--`), and requires building with `--features pty`.
     Pty,
@@ -321,6 +324,7 @@ fn backend_for(backend: Backend, pane: String) -> anyhow::Result<Box<dyn PaneBac
     match backend {
         Backend::Tmux => Ok(Box::new(TmuxBackend::new(pane))),
         Backend::Zellij => Ok(Box::new(ZellijBackend::new(pane))),
+        Backend::Screen => Ok(Box::new(ScreenBackend::new(pane))),
         Backend::Pty => anyhow::bail!(
             "the pty backend spawns a program, so it only works with `run ... -- <program>`, not one-shot commands"
         ),
@@ -347,6 +351,12 @@ fn run_backend(
                 anyhow::anyhow!("--pane (session name) is required for the zellij backend")
             })?;
             Ok(Box::new(ZellijBackend::new(session)))
+        }
+        Backend::Screen => {
+            let session = pane.ok_or_else(|| {
+                anyhow::anyhow!("--pane (session name) is required for the screen backend")
+            })?;
+            Ok(Box::new(ScreenBackend::new(session)))
         }
         Backend::Pty => spawn_pty(program, rows, cols),
     }
