@@ -11,7 +11,11 @@ fn main() {
 
     let git = |args: &[&str]| -> Option<String> {
         // TZ=UTC so `format-local` renders the commit time in UTC for the `Z`.
-        let out = Command::new("git").env("TZ", "UTC").args(args).output().ok()?;
+        let out = Command::new("git")
+            .env("TZ", "UTC")
+            .args(args)
+            .output()
+            .ok()?;
         if !out.status.success() {
             return None;
         }
