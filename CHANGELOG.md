@@ -29,6 +29,19 @@ Both crates (`paneview` and `panedrive`) share one version and are released toge
   `--from-env VAR` (resolved at run time, never baked into the script) and
   `--paste` (route through the backend's paste transport), so scripted logins do
   not put secrets in the script file or in `send-keys` argv.
+- **Richer conditions**: numeric `>`, `<`, `>=`, `<=` and substring `~=`
+  (contains), in addition to `=` / `!=` / existence.
+- **Structured-scrape fallback**: `run --from-capture` evaluates conditions
+  against the captured screen (`screen`, `lines.<n>`) instead of a JSON seam, so
+  an uninstrumented app degrades gracefully instead of not working.
+- **`run --settle`**: after each key/type step, wait for the seam to change
+  before the next step, so an `assert` right after a `press` does not race the
+  UI's asynchronous snapshot.
+- **Cross-language seam spec** (`docs/SEAM.md`): the one-page JSON-file contract
+  plus Rust/Go/Python/JS adapters, since the driver is language-agnostic.
+- **Build metadata in `--version`**: `panedrive --version` now reports the git
+  short-SHA and commit date (e.g. `0.1.1 (a1b2c3d4e5 2026-08-28)`), with a clean
+  fallback to the bare version when built without git.
 - `CHANGELOG.md` following Keep a Changelog.
 - `docs.rs` metadata to build both crates with all features.
 

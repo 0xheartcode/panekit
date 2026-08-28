@@ -92,6 +92,10 @@ impl DumpState for App {
 write_snapshot(&app, std::path::Path::new("run.state.json"))?;
 ```
 
+Not a Rust UI? The seam is just a JSON file, so any language can expose one by
+writing the same shape (atomically). See [`docs/SEAM.md`](docs/SEAM.md) for the
+one-page contract and Go/Python/JS adapters.
+
 **2. Drive it** (`panedrive`), from a shell or an agent:
 
 ```bash
@@ -148,7 +152,14 @@ and owns the target program, so it must live for the whole script.
 After a key that *changes* state, `wait-until` the new state rather than
 `assert` it immediately: the UI writes its next snapshot asynchronously, so an
 `assert` right after a `press` can read the pre-change seam. Use `assert` for
-state that has already settled.
+state that has already settled. Or pass **`--settle`** to `run`, and every
+key/type step waits (up to ~1s) for the seam to change before the next step, so
+you can `assert` right after a `press` without the race.
+
+No seam to read? **`run --from-capture`** evaluates conditions against the
+captured screen text instead of a state file (`screen` is the whole screen,
+`lines.<n>` each row), so `wait-until "screen~=Ready" --from-capture` drives an
+uninstrumented app. Less precise than a real seam, but it degrades gracefully.
 
 ### Conditions
 
@@ -160,6 +171,8 @@ state that has already settled.
 | `focus=fleet` | scalar at the path equals `fleet` |
 | `open=true` | booleans/numbers compare by text |
 | `bag.count!=0` | path exists and its scalar differs |
+| `bag.count>2` | numeric compare (`>`, `<`, `>=`, `<=`) |
+| `line~=Ready` | the scalar contains the substring |
 | `rows.2=x` | array indices are path segments |
 
 Equality is numeric-aware: `count=2` matches a JSON `2` or `2.0` (and `1e3`
