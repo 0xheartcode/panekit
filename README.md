@@ -137,12 +137,18 @@ panedrive run login.pds --backend tmux --pane mysession:1.0 --state run.state.js
 panedrive run login.pds --backend pty --state run.state.json -- ./my-tui --flag
 ```
 
-Steps: `press <keys>`, `type <text>`, `wait-until <cond> [--timeout-ms N]
+Steps: `press <keys>`, `type <text>` (also `type --from-env VAR` and
+`type --paste ...` for secrets, see below), `wait-until <cond> [--timeout-ms N]
 [--interval-ms N]`, `assert <cond>`, `capture`, `sleep <200ms|1s|N>`. The run
 stops at the first failing `assert`/`wait-until` and maps to the same exit codes
 (`0` all passed, `1` a step failed, `2` usage or backend error). `run` is the
 only way to drive the **PTY** backend from the CLI, because that backend spawns
 and owns the target program, so it must live for the whole script.
+
+After a key that *changes* state, `wait-until` the new state rather than
+`assert` it immediately: the UI writes its next snapshot asynchronously, so an
+`assert` right after a `press` can read the pre-change seam. Use `assert` for
+state that has already settled.
 
 ### Conditions
 
@@ -169,6 +175,16 @@ read -rs VAULT_PASS
 printf %s "$VAULT_PASS" | panedrive type --stdin --pane mysession:1.0
 # or
 panedrive type --from-env VAULT_PASS --pane mysession:1.0
+```
+
+Inside a `run` script the same is available, so a scripted login never puts the
+secret in the script file:
+
+```text
+# login.pds
+wait-until prompt=password
+type --from-env VAULT_PASS      # or: type --paste --from-env VAULT_PASS
+press Enter
 ```
 
 Transport matters too, not just the source:

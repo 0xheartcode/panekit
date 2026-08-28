@@ -25,6 +25,10 @@ Both crates (`paneview` and `panedrive`) share one version and are released toge
   -- <program> [args...]`. The attach backends batch steps the same way with
   `--pane`. Exit codes match the single-shot contract (0 pass, 1 failed
   assert/wait, 2 usage or backend error).
+- **Secret-safe `type` in scripts**: a script `type` step accepts
+  `--from-env VAR` (resolved at run time, never baked into the script) and
+  `--paste` (route through the backend's paste transport), so scripted logins do
+  not put secrets in the script file or in `send-keys` argv.
 - `CHANGELOG.md` following Keep a Changelog.
 - `docs.rs` metadata to build both crates with all features.
 
