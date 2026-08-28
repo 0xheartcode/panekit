@@ -22,6 +22,31 @@ cargo install panedrive --features pty   # add the PTY backend
 cargo add paneview               # the state seam, in your UI's crate
 ```
 
+## Try it in a minute
+
+The repo ships a tiny `counter_tui` example whose seam is
+`{ "count": <n>, "last": <cmd>, "ready": <bool> }`. Drive it headlessly with a
+script, no terminal to watch:
+
+```bash
+git clone https://github.com/0xheartcode/panekit && cd panekit
+cargo build -p panedrive --features pty --example counter_tui
+
+# spawn the TUI in a PTY, type two `inc` commands, wait for the seam to catch up
+panedrive run panedrive/examples/counter.pds \
+  --backend pty --state /tmp/counter.state.json \
+  -- ./target/debug/examples/counter_tui /tmp/counter.state.json
+
+echo $?                      # 0: every step passed
+cat /tmp/counter.state.json  # {"count":2,"last":"inc","ready":true}
+```
+
+Nothing here is counter-specific: the seam is whatever JSON *your* UI puts in
+`dump_state`, and conditions are dot-paths into it. Watch a clock field tick,
+gate on `queue.len!=0`, assert `date=2026-08-28`, or check a nested
+`rows.2.status=done`; the driver only reads JSON, so it works the same for any
+shape of state.
+
 ## Why this exists
 
 Browsers have Playwright; terminal UIs had nothing clean for the *agent* case.
