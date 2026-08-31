@@ -17,6 +17,7 @@ pub mod condition;
 pub mod driver;
 pub mod key;
 pub mod script;
+pub mod seam;
 
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;

@@ -19,7 +19,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use panedrive::{
     Key, Observed, PaneBackend, RunEvent, RunResult, ScreenBackend, TmuxBackend, WaitOutcome,
-    ZellijBackend, condition::Condition, driver, key, parse_script, run_script_recording,
+    ZellijBackend, condition::Condition, driver, key, parse_script, run_script_recording, seam,
 };
 use serde_json::Value;
 
@@ -82,7 +82,7 @@ enum Cmd {
     WaitUntil {
         /// Condition over the state JSON, e.g. `focus=fleet` or `bag.count!=0`.
         cond: String,
-        #[arg(long)]
+        #[arg(long, env = "PANEDRIVE_STATE")]
         state: PathBuf,
         #[arg(long, default_value_t = 5000)]
         timeout_ms: u64,
@@ -92,11 +92,31 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show the state seam: pretty-print it, or (with `--paths`) list every
+    /// assertable dot-path so you can see what conditions can target.
+    State {
+        #[arg(long, env = "PANEDRIVE_STATE")]
+        state: PathBuf,
+        /// List each assertable dot-path with its value and type, instead of
+        /// pretty-printing the whole document.
+        #[arg(long)]
+        paths: bool,
+    },
+    /// Check a JSON file against the state-seam contract (an object with scalar
+    /// leaves). Useful when bringing up a non-Rust seam adapter. Exit `0` if
+    /// clean, `1` on a violation.
+    ValidateSeam {
+        /// Path to the JSON seam file to check.
+        file: PathBuf,
+        /// Emit the report as a JSON object on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Evaluate a condition against the state seam once (no waiting).
     Assert {
         /// Condition over the state JSON.
         cond: String,
-        #[arg(long)]
+        #[arg(long, env = "PANEDRIVE_STATE")]
         state: PathBuf,
         /// Emit the result as a JSON object on stdout (the exit code is
         /// unchanged), e.g. `{"ok":false,"cond":"count=2","actual":"1"}`.
@@ -107,7 +127,7 @@ enum Cmd {
     /// JSONL line (`{"t_ms":..,"state":..}`), catches transitions a single
     /// assert would miss. Pair with `press` to record what the UI does.
     Watch {
-        #[arg(long)]
+        #[arg(long, env = "PANEDRIVE_STATE")]
         state: PathBuf,
         /// How long to record for.
         #[arg(long, default_value_t = 5000)]
@@ -132,8 +152,9 @@ enum Cmd {
         script: PathBuf,
         #[arg(long, value_enum, default_value_t = Backend::Tmux)]
         backend: Backend,
-        /// State seam path that `assert` / `wait-until` steps read.
-        #[arg(long)]
+        /// State seam path that `assert` / `wait-until` steps read (defaults to
+        /// $PANEDRIVE_STATE). Point the app's snapshot writer at the same path.
+        #[arg(long, env = "PANEDRIVE_STATE")]
         state: Option<PathBuf>,
         /// Target for the attach backends: a tmux pane, or a zellij session.
         #[arg(long)]
@@ -277,6 +298,55 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     Ok(ExitCode::from(1))
                 }
             }
+        }
+        Cmd::State { state, paths } => {
+            let value = driver::read_state_file(&state)
+                .ok_or_else(|| anyhow::anyhow!("no readable JSON state at {}", state.display()))?;
+            if paths {
+                let leaves = seam::leaves(&value);
+                if leaves.is_empty() {
+                    eprintln!("(no assertable paths)");
+                }
+                let width = leaves.iter().map(|l| l.path.len()).max().unwrap_or(0);
+                for l in &leaves {
+                    println!("{:<width$} = {}  ({})", l.path, l.value, l.kind);
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::ValidateSeam { file, json } => {
+            let bytes = std::fs::read(&file)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+            let report = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) => seam::validate(&value),
+                Err(e) => seam::SeamReport {
+                    ok: false,
+                    problems: vec![format!("invalid JSON: {e}")],
+                    paths: 0,
+                },
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": report.ok, "paths": report.paths,
+                        "problems": report.problems,
+                    })
+                );
+            } else if report.ok {
+                println!("seam ok: {} assertable path(s)", report.paths);
+            } else {
+                for p in &report.problems {
+                    eprintln!("seam problem: {p}");
+                }
+            }
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
         }
         Cmd::Assert { cond, state, json } => {
             let cond = Condition::parse(&cond)?;
