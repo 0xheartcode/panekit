@@ -242,6 +242,50 @@ mod tests {
     }
 
     #[test]
+    fn write_output_uses_elapsed_time() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut cast = CastWriter::new(&mut buf, 10, 2).unwrap();
+            cast.write_output(b"x").unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let ev: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(ev[2], "x");
+        assert!(ev[0].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn tail_into_cast_emits_events_from_a_raw_file() {
+        // Pre-seed the raw file and preset stop=true, so the tail reads the
+        // existing bytes once and exits, exercising the loop without tmux.
+        let dir = std::env::temp_dir();
+        let raw = dir.join(format!("panedrive-cast-test-raw-{}", std::process::id()));
+        let outp = dir.join(format!("panedrive-cast-test-out-{}", std::process::id()));
+        std::fs::write(&raw, b"hello\x1b[Kworld").unwrap();
+        let out = File::create(&outp).unwrap();
+        let stop = AtomicBool::new(true);
+        tail_into_cast(&raw, out, 80, 24, &stop);
+
+        let text = std::fs::read_to_string(&outp).unwrap();
+        let mut lines = text.lines();
+        let header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(header["version"], 2);
+        let body: String = lines
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v[2].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert!(
+            body.contains("hello") && body.contains("world"),
+            "body: {body}"
+        );
+
+        std::fs::remove_file(&raw).ok();
+        std::fs::remove_file(&outp).ok();
+    }
+
+    #[test]
     fn shell_quote_wraps_and_escapes() {
         assert_eq!(shell_quote(std::path::Path::new("/tmp/a b")), "'/tmp/a b'");
     }

@@ -952,6 +952,99 @@ mod tests {
     }
 
     #[test]
+    fn step_failure_serializes_and_explains_each_reason() {
+        let unmet = StepFailure {
+            step: 2,
+            kind: "assert",
+            cond: "count=2".into(),
+            path: "count".into(),
+            reason: FailReason::Unmet {
+                observed: Observed::Scalar("1".into()),
+            },
+        };
+        assert_eq!(unmet.to_json()["actual"], json!("1"));
+        assert!(
+            unmet
+                .human()
+                .contains("step 2: assert count=2 did not hold (count was 1)")
+        );
+
+        let no_state = StepFailure {
+            step: 1,
+            kind: "assert",
+            cond: "x=1".into(),
+            path: "x".into(),
+            reason: FailReason::NoState,
+        };
+        assert_eq!(no_state.to_json()["error"], json!("no readable state"));
+        assert!(no_state.human().contains("has no readable state"));
+
+        let timed_out = StepFailure {
+            step: 3,
+            kind: "wait-until",
+            cond: "y=1".into(),
+            path: "y".into(),
+            reason: FailReason::TimedOut {
+                timeout_ms: 500,
+                observed: Observed::Missing,
+            },
+        };
+        let j = timed_out.to_json();
+        assert_eq!(j["timeout_ms"], json!(500));
+        assert_eq!(j["actual"], json!(null));
+        assert!(timed_out.human().contains("timed out after 500 ms"));
+    }
+
+    #[test]
+    fn run_event_json_omits_absent_ok_and_actual() {
+        let assertion = RunEvent {
+            t_ms: 5,
+            step: 1,
+            kind: "assert",
+            detail: "count=1".into(),
+            ok: Some(true),
+            actual: Some("1".into()),
+        };
+        let j = assertion.to_json();
+        assert_eq!(j["ok"], json!(true));
+        assert_eq!(j["actual"], json!("1"));
+
+        let press = RunEvent {
+            t_ms: 0,
+            step: 2,
+            kind: "press",
+            detail: "Enter".into(),
+            ok: None,
+            actual: None,
+        };
+        let j2 = press.to_json();
+        assert!(j2.get("ok").is_none());
+        assert!(j2.get("actual").is_none());
+    }
+
+    #[test]
+    fn recording_reports_timeout_with_last_observed() {
+        let steps = parse_script("wait-until ready=true --timeout-ms 5 --interval-ms 1").unwrap();
+        let mut events: Vec<RunEvent> = Vec::new();
+        let out = run_script_recording(
+            &steps,
+            &mock(),
+            None,
+            || Some(json!({ "ready": false })),
+            |_| {},
+            |e| events.push(e.clone()),
+        )
+        .unwrap();
+        let RunResult::Failed(f) = out else {
+            panic!("expected a timeout failure");
+        };
+        assert!(matches!(f.reason, FailReason::TimedOut { .. }));
+        let last = events.last().unwrap();
+        assert_eq!(last.kind, "wait-until");
+        assert_eq!(last.ok, Some(false));
+    }
+
+    #[test]
     fn run_fails_when_wait_until_times_out() {
         let steps = parse_script("wait-until ready=true --timeout-ms 5 --interval-ms 1").unwrap();
         let out = run_script(&steps, &mock(), || Some(json!({ "ready": false })), |_| {}).unwrap();
