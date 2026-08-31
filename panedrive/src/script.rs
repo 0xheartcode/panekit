@@ -24,9 +24,9 @@
 //! passes (exit 0).
 
 use crate::backend::PaneBackend;
-use crate::condition::Condition;
+use crate::condition::{Condition, Observed};
 use crate::driver::wait_until;
-use crate::key::{self, Key};
+use crate::key::{self, Key, TmuxKey};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -71,8 +71,152 @@ pub enum TypeSource {
 pub enum RunResult {
     /// Every step passed.
     Passed,
-    /// An `assert`/`wait-until` step did not hold; the string explains which.
-    Failed(String),
+    /// An `assert`/`wait-until` step did not hold; the failure explains which
+    /// step, the condition, and what the state actually held.
+    Failed(StepFailure),
+}
+
+/// A structured description of the step that ended a run, carrying enough detail
+/// to explain the failure (and serialize it) without re-reading the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepFailure {
+    /// 1-based step number in the script.
+    pub step: usize,
+    /// The failing verb, `"assert"` or `"wait-until"`.
+    pub kind: &'static str,
+    /// The condition spec that failed, in canonical form (`bag.count=2`).
+    pub cond: String,
+    /// The dot-path the condition addressed.
+    pub path: String,
+    /// Why it failed.
+    pub reason: FailReason,
+}
+
+/// Why a step failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailReason {
+    /// The condition did not hold; `observed` is what the path resolved to.
+    Unmet { observed: Observed },
+    /// There was no readable state seam to check against.
+    NoState,
+    /// A `wait-until` timed out; `observed` is the last thing the path held.
+    TimedOut { timeout_ms: u64, observed: Observed },
+}
+
+impl StepFailure {
+    /// A one-line human explanation, e.g.
+    /// `step 2: assert bag.count=2 did not hold (bag.count was 1)`.
+    pub fn human(&self) -> String {
+        match &self.reason {
+            FailReason::NoState => format!(
+                "step {}: {} {} has no readable state",
+                self.step, self.kind, self.cond
+            ),
+            FailReason::Unmet { observed } => format!(
+                "step {}: {} {} did not hold ({})",
+                self.step,
+                self.kind,
+                self.cond,
+                observed.describe(&self.path)
+            ),
+            FailReason::TimedOut {
+                timeout_ms,
+                observed,
+            } => format!(
+                "step {}: {} {} timed out after {timeout_ms} ms ({})",
+                self.step,
+                self.kind,
+                self.cond,
+                observed.describe(&self.path)
+            ),
+        }
+    }
+
+    /// The machine-readable form for `--json`.
+    pub fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("step".into(), self.step.into());
+        m.insert("kind".into(), self.kind.into());
+        m.insert("cond".into(), self.cond.clone().into());
+        m.insert("path".into(), self.path.clone().into());
+        match &self.reason {
+            FailReason::NoState => {
+                m.insert("error".into(), "no readable state".into());
+            }
+            FailReason::Unmet { observed } => {
+                m.insert("actual".into(), scalar_json(observed));
+            }
+            FailReason::TimedOut {
+                timeout_ms,
+                observed,
+            } => {
+                m.insert("timeout_ms".into(), (*timeout_ms).into());
+                m.insert("actual".into(), scalar_json(observed));
+            }
+        }
+        Value::Object(m)
+    }
+}
+
+/// One recorded step during a run, the unit of the `--events` track and the
+/// `steps` array of the `--json` summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEvent {
+    /// Milliseconds since the run started.
+    pub t_ms: u64,
+    /// 1-based step number.
+    pub step: usize,
+    /// The verb: `press`, `type`, `assert`, `wait-until`, `capture`, `sleep`.
+    pub kind: &'static str,
+    /// A short description (keys pressed, condition spec, duration). Never a
+    /// secret: `type --from-env VAR` records the variable name, not its value.
+    pub detail: String,
+    /// For `assert`/`wait-until`, whether it held; `None` for input steps.
+    pub ok: Option<bool>,
+    /// For condition steps, the scalar the path held, if any.
+    pub actual: Option<String>,
+}
+
+impl RunEvent {
+    /// The machine-readable form, one JSONL line in the `--events` file.
+    pub fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("t_ms".into(), self.t_ms.into());
+        m.insert("step".into(), self.step.into());
+        m.insert("kind".into(), self.kind.into());
+        m.insert("detail".into(), self.detail.clone().into());
+        if let Some(ok) = self.ok {
+            m.insert("ok".into(), ok.into());
+        }
+        if let Some(a) = &self.actual {
+            m.insert("actual".into(), a.clone().into());
+        }
+        Value::Object(m)
+    }
+}
+
+/// Render an `Observed` scalar as JSON, or `null` when the path was absent or
+/// non-scalar.
+fn scalar_json(observed: &Observed) -> Value {
+    match observed.scalar() {
+        Some(s) => Value::String(s.to_string()),
+        None => Value::Null,
+    }
+}
+
+/// A readable spelling of a key run for an event `detail`, e.g. `Down Down Enter`.
+fn keys_detail(keys: &[Key]) -> String {
+    let mut out = String::new();
+    for k in keys {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        match k.to_tmux() {
+            TmuxKey::Literal(c) => out.push(c),
+            TmuxKey::Named(name) => out.push_str(&name),
+        }
+    }
+    out
 }
 
 impl Step {
@@ -146,13 +290,35 @@ pub fn run_script_settling<P, E>(
     steps: &[Step],
     backend: &dyn PaneBackend,
     settle: Option<Duration>,
-    mut probe: P,
-    mut emit: E,
+    probe: P,
+    emit: E,
 ) -> anyhow::Result<RunResult>
 where
     P: FnMut() -> Option<Value>,
     E: FnMut(&str),
 {
+    run_script_recording(steps, backend, settle, probe, emit, |_| {})
+}
+
+/// Like [`run_script_settling`], but also hands every executed step to
+/// `on_event` as a [`RunEvent`] (timestamped, with the assertion outcome). This
+/// is what powers the `--events` track and the `--json` run summary; the events
+/// are emitted as the run progresses, so the sink sees the failing step too.
+pub fn run_script_recording<P, E, V>(
+    steps: &[Step],
+    backend: &dyn PaneBackend,
+    settle: Option<Duration>,
+    mut probe: P,
+    mut emit: E,
+    mut on_event: V,
+) -> anyhow::Result<RunResult>
+where
+    P: FnMut() -> Option<Value>,
+    E: FnMut(&str),
+    V: FnMut(&RunEvent),
+{
+    let run_start = Instant::now();
+    let t_ms = |start: Instant| start.elapsed().as_millis() as u64;
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         match step {
@@ -160,6 +326,14 @@ where
                 let before = if settle.is_some() { probe() } else { None };
                 backend.send_keys(keys)?;
                 settle_after(settle, &before, &mut probe);
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "press",
+                    detail: keys_detail(keys),
+                    ok: None,
+                    actual: None,
+                });
             }
             Step::Type { source, paste } => {
                 let text = match source {
@@ -176,32 +350,100 @@ where
                     backend.send_keys(&keys)?;
                 }
                 settle_after(settle, &before, &mut probe);
+                // Never log the secret itself: record the source, not the value.
+                let detail = match source {
+                    TypeSource::Literal(s) => s.clone(),
+                    TypeSource::FromEnv(var) => format!("--from-env {var}"),
+                };
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "type",
+                    detail,
+                    ok: None,
+                    actual: None,
+                });
             }
-            Step::Sleep(d) => std::thread::sleep(*d),
-            Step::Capture => emit(&backend.capture()?),
-            Step::Assert(cond) => match probe() {
-                Some(v) if cond.eval(&v) => {}
-                Some(_) => {
-                    return Ok(RunResult::Failed(format!(
-                        "step {n}: assert {cond:?} did not hold"
-                    )));
+            Step::Sleep(d) => {
+                std::thread::sleep(*d);
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "sleep",
+                    detail: format!("{} ms", d.as_millis()),
+                    ok: None,
+                    actual: None,
+                });
+            }
+            Step::Capture => {
+                emit(&backend.capture()?);
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "capture",
+                    detail: String::new(),
+                    ok: None,
+                    actual: None,
+                });
+            }
+            Step::Assert(cond) => {
+                let (ok, observed, has_state) = match probe() {
+                    Some(v) => (cond.eval(&v), cond.observed(&v), true),
+                    None => (false, Observed::Missing, false),
+                };
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "assert",
+                    detail: cond.to_spec(),
+                    ok: Some(ok),
+                    actual: observed.scalar().map(str::to_string),
+                });
+                if !ok {
+                    let reason = if has_state {
+                        FailReason::Unmet { observed }
+                    } else {
+                        FailReason::NoState
+                    };
+                    return Ok(RunResult::Failed(StepFailure {
+                        step: n,
+                        kind: "assert",
+                        cond: cond.to_spec(),
+                        path: cond.path().to_string(),
+                        reason,
+                    }));
                 }
-                None => {
-                    return Ok(RunResult::Failed(format!(
-                        "step {n}: assert {cond:?} has no readable state"
-                    )));
-                }
-            },
+            }
             Step::WaitUntil {
                 cond,
                 timeout,
                 interval,
             } => {
-                if !wait_until(cond, *timeout, *interval, &mut probe).is_satisfied() {
-                    return Ok(RunResult::Failed(format!(
-                        "step {n}: wait-until {cond:?} timed out after {} ms",
-                        timeout.as_millis()
-                    )));
+                let outcome = wait_until(cond, *timeout, *interval, &mut probe);
+                let ok = outcome.is_satisfied();
+                // A final probe gives the event/failure the last observed value.
+                let observed = probe()
+                    .map(|v| cond.observed(&v))
+                    .unwrap_or(Observed::Missing);
+                on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind: "wait-until",
+                    detail: cond.to_spec(),
+                    ok: Some(ok),
+                    actual: observed.scalar().map(str::to_string),
+                });
+                if !ok {
+                    return Ok(RunResult::Failed(StepFailure {
+                        step: n,
+                        kind: "wait-until",
+                        cond: cond.to_spec(),
+                        path: cond.path().to_string(),
+                        reason: FailReason::TimedOut {
+                            timeout_ms: timeout.as_millis() as u64,
+                            observed,
+                        },
+                    }));
                 }
             }
         }
@@ -626,17 +868,97 @@ mod tests {
     }
 
     #[test]
+    fn failed_assert_carries_the_observed_value() {
+        let steps = parse_script("assert count=2").unwrap();
+        let out = run_script(&steps, &mock(), || Some(json!({ "count": 1 })), |_| {}).unwrap();
+        let RunResult::Failed(f) = out else {
+            panic!("expected a failure");
+        };
+        assert_eq!(f.step, 1);
+        assert_eq!(f.kind, "assert");
+        assert_eq!(f.cond, "count=2");
+        assert_eq!(
+            f.reason,
+            FailReason::Unmet {
+                observed: Observed::Scalar("1".into())
+            }
+        );
+        assert!(
+            f.human().contains("count=2 did not hold (count was 1)"),
+            "{}",
+            f.human()
+        );
+        assert_eq!(f.to_json()["actual"], json!("1"));
+    }
+
+    #[test]
+    fn recording_emits_one_event_per_step_with_outcomes() {
+        let steps = parse_script("press Down\nassert count=1").unwrap();
+        let mut events: Vec<RunEvent> = Vec::new();
+        let out = run_script_recording(
+            &steps,
+            &mock(),
+            None,
+            || Some(json!({ "count": 1 })),
+            |_| {},
+            |e| events.push(e.clone()),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "press");
+        assert_eq!(events[0].detail, "Down");
+        assert_eq!(events[1].kind, "assert");
+        assert_eq!(events[1].ok, Some(true));
+        assert_eq!(events[1].actual.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn recording_never_logs_a_secret_value() {
+        // SAFETY: single-threaded test; the var is set and read within it.
+        unsafe {
+            std::env::set_var("PANEDRIVE_TEST_SECRET2", "hunter2");
+        }
+        let steps = parse_script("type --from-env PANEDRIVE_TEST_SECRET2").unwrap();
+        let mut events: Vec<RunEvent> = Vec::new();
+        run_script_recording(
+            &steps,
+            &mock(),
+            None,
+            || None,
+            |_| {},
+            |e| events.push(e.clone()),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("PANEDRIVE_TEST_SECRET2");
+        }
+        assert_eq!(events[0].kind, "type");
+        assert_eq!(events[0].detail, "--from-env PANEDRIVE_TEST_SECRET2");
+        assert!(
+            !events[0].detail.contains("hunter2"),
+            "the secret value must never reach the event track"
+        );
+    }
+
+    #[test]
     fn run_fails_on_assert_without_state() {
         let steps = parse_script("assert ready=true").unwrap();
         let out = run_script(&steps, &mock(), || None, |_| {}).unwrap();
-        assert!(matches!(out, RunResult::Failed(msg) if msg.contains("no readable state")));
+        assert!(matches!(
+            out,
+            RunResult::Failed(f) if matches!(f.reason, FailReason::NoState)
+        ));
     }
 
     #[test]
     fn run_fails_when_wait_until_times_out() {
         let steps = parse_script("wait-until ready=true --timeout-ms 5 --interval-ms 1").unwrap();
         let out = run_script(&steps, &mock(), || Some(json!({ "ready": false })), |_| {}).unwrap();
-        assert!(matches!(out, RunResult::Failed(msg) if msg.contains("timed out")));
+        assert!(matches!(
+            out,
+            RunResult::Failed(f) if matches!(f.reason, FailReason::TimedOut { .. })
+        ));
     }
 
     #[test]

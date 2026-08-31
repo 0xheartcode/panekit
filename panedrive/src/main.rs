@@ -11,16 +11,17 @@
 //! `2` usage or backend error. That makes `assert` and `wait-until` usable as
 //! shell gates and in CI.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use panedrive::{
-    Key, PaneBackend, RunResult, ScreenBackend, TmuxBackend, WaitOutcome, ZellijBackend,
-    condition::Condition, driver, key, parse_script, run_script_settling,
+    Key, Observed, PaneBackend, RunEvent, RunResult, ScreenBackend, TmuxBackend, WaitOutcome,
+    ZellijBackend, condition::Condition, driver, key, parse_script, run_script_recording,
 };
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +88,9 @@ enum Cmd {
         timeout_ms: u64,
         #[arg(long, default_value_t = 50)]
         interval_ms: u64,
+        /// Emit the result as a JSON object on stdout (exit code unchanged).
+        #[arg(long)]
+        json: bool,
     },
     /// Evaluate a condition against the state seam once (no waiting).
     Assert {
@@ -94,6 +98,10 @@ enum Cmd {
         cond: String,
         #[arg(long)]
         state: PathBuf,
+        /// Emit the result as a JSON object on stdout (the exit code is
+        /// unchanged), e.g. `{"ok":false,"cond":"count=2","actual":"1"}`.
+        #[arg(long)]
+        json: bool,
     },
     /// Record the state seam over a window, printing each observed state as a
     /// JSONL line (`{"t_ms":..,"state":..}`), catches transitions a single
@@ -147,6 +155,13 @@ enum Cmd {
         /// `lines.<n>`) instead of a JSON state file, for apps with no seam.
         #[arg(long)]
         from_capture: bool,
+        /// Emit a JSON run summary on stdout: `{ok, failed_step?, steps:[..]}`.
+        #[arg(long)]
+        json: bool,
+        /// Write a JSONL event track (one line per step, timestamped) to this
+        /// path, for aligning a `--cast` recording or feeding CI/an agent.
+        #[arg(long)]
+        events: Option<PathBuf>,
     },
 }
 
@@ -215,6 +230,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             state,
             timeout_ms,
             interval_ms,
+            json,
         } => {
             let cond = Condition::parse(&cond)?;
             let outcome = driver::wait_until(
@@ -225,25 +241,78 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
             match outcome {
                 WaitOutcome::Satisfied(took) => {
-                    eprintln!("held after {} ms", took.as_millis());
+                    let took = took.as_millis() as u64;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": true, "cond": cond.to_spec(), "waited_ms": took,
+                            })
+                        );
+                    } else {
+                        eprintln!("held after {took} ms");
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 WaitOutcome::TimedOut => {
-                    eprintln!("timed out after {timeout_ms} ms");
+                    // Read once more so the message/JSON can report what the seam
+                    // last held, not just that it timed out.
+                    let observed = driver::read_state_file(&state)
+                        .map(|v| cond.observed(&v))
+                        .unwrap_or(Observed::Missing);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": false, "cond": cond.to_spec(), "path": cond.path(),
+                                "timeout_ms": timeout_ms, "actual": observed_json(&observed),
+                            })
+                        );
+                    } else {
+                        eprintln!(
+                            "timed out after {timeout_ms} ms ({})",
+                            observed.describe(cond.path())
+                        );
+                    }
                     Ok(ExitCode::from(1))
                 }
             }
         }
-        Cmd::Assert { cond, state } => {
+        Cmd::Assert { cond, state, json } => {
             let cond = Condition::parse(&cond)?;
             match driver::read_state_file(&state) {
-                Some(value) if cond.eval(&value) => Ok(ExitCode::SUCCESS),
-                Some(_) => {
-                    eprintln!("assertion failed: {cond:?}");
-                    Ok(ExitCode::from(1))
+                Some(value) => {
+                    let ok = cond.eval(&value);
+                    if json {
+                        let actual = observed_json(&cond.observed(&value));
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": ok, "cond": cond.to_spec(),
+                                "path": cond.path(), "actual": actual,
+                            })
+                        );
+                    } else if !ok {
+                        eprintln!("assert failed: {}", cond.explain(&value));
+                    }
+                    Ok(if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    })
                 }
                 None => {
-                    eprintln!("no readable state at {}", state.display());
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": false, "cond": cond.to_spec(),
+                                "error": "no readable state",
+                            })
+                        );
+                    } else {
+                        eprintln!("no readable state at {}", state.display());
+                    }
                     Ok(ExitCode::from(1))
                 }
             }
@@ -277,6 +346,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             cols,
             settle,
             from_capture,
+            json,
+            events,
         } => {
             let text = std::fs::read_to_string(&script)
                 .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
@@ -292,16 +363,62 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 Box::new(move || state.as_deref().and_then(driver::read_state_file))
             };
-            let outcome =
-                run_script_settling(&steps, b, settle, &mut probe, |screen| print!("{screen}"))?;
+            let mut events_file =
+                match &events {
+                    Some(p) => Some(std::fs::File::create(p).map_err(|e| {
+                        anyhow::anyhow!("creating events file {}: {e}", p.display())
+                    })?),
+                    None => None,
+                };
+            let mut collected: Vec<RunEvent> = Vec::new();
+            let outcome = run_script_recording(
+                &steps,
+                b,
+                settle,
+                &mut probe,
+                |screen| print!("{screen}"),
+                |e| {
+                    if let Some(f) = events_file.as_mut() {
+                        let _ = writeln!(f, "{}", e.to_json());
+                    }
+                    if json {
+                        collected.push(e.clone());
+                    }
+                },
+            )?;
+            let steps_json: Vec<Value> = collected.iter().map(RunEvent::to_json).collect();
             match outcome {
-                RunResult::Passed => Ok(ExitCode::SUCCESS),
-                RunResult::Failed(why) => {
-                    eprintln!("{why}");
+                RunResult::Passed => {
+                    if json {
+                        println!("{}", serde_json::json!({ "ok": true, "steps": steps_json }));
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                RunResult::Failed(failure) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": false, "failed_step": failure.step,
+                                "failure": failure.to_json(), "steps": steps_json,
+                            })
+                        );
+                    } else {
+                        eprintln!("{}", failure.human());
+                    }
                     Ok(ExitCode::from(1))
                 }
             }
         }
+    }
+}
+
+/// Render an observed path value as JSON for `--json` output: the scalar text,
+/// or `null` when the path was absent or non-scalar.
+fn observed_json(observed: &Observed) -> Value {
+    match observed.scalar() {
+        Some(s) => Value::String(s.to_string()),
+        None => Value::Null,
     }
 }
 
