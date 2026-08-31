@@ -8,6 +8,20 @@ Entries are kept on a single line each: cargo-dist injects this file into the Gi
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-31
+
+### Added
+
+- **Rich assertion failures**: a failed `assert` (and a failed `run` step) now reports the value the seam actually held, e.g. `assert failed: count=2 (count was 1)`, instead of a Debug-printed condition, so you can see *why* without re-reading the state.
+- **`--json` results**: `assert`, `wait-until`, and `run` take `--json` to emit a machine-readable result on stdout (exit codes unchanged), turning panedrive into a clean tool-call target for CI or an agent.
+- **`run --events <path>`**: write a timestamped JSONL event track (one line per step, with the assertion outcome), for feeding CI/an agent or aligning a `--cast` recording. Secrets from `type --from-env` are never recorded.
+- **`panedrive state [--paths]`**: pretty-print the seam, or list every assertable dot-path with its value and type, so you can see the surface a condition can target before writing one.
+- **`panedrive validate-seam <file>`**: check a JSON file against the seam contract (object root, scalar leaves), human-readable or `--json`, for bringing up a non-Rust adapter.
+- **`--cast <path>`**: `run` records an asciinema v2 cast of the session on the pty backend (native) and tmux (via `pipe-pane`); screen and zellij are rejected since they expose only snapshots, not a byte stream.
+- **`panedrive record`**: spawn a program in a PTY, forward your keystrokes to it, and write what you pressed as a `.pds` script (Ctrl-] to stop); optional `--cast`. Requires the `pty` feature.
+- **Node.js seam adapter** (`adapters/node`): a dependency-free `writeSnapshot`, a dogfooded example, and a driving script that reuses the Rust example's exact conditions, proving the seam is language-agnostic.
+- **`PANEDRIVE_STATE`**: `--state` defaults from this environment variable across commands, so the app's snapshot writer and the driver can share one path instead of hand-syncing it.
+
 ### Changed
 
 - CHANGELOG: keep each entry on one line so the generated release notes render as flowing paragraphs instead of hard-wrapped fragments.
@@ -46,6 +60,7 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **Dependency-layering wall** (`make deps`): `panedrive` may depend on `paneview`, never the reverse.
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
-[Unreleased]: https://github.com/0xheartcode/panekit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/0xheartcode/panekit/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/0xheartcode/panekit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/0xheartcode/panekit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/0xheartcode/panekit/releases/tag/v0.1.0

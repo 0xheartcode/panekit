@@ -8,11 +8,13 @@
 **Drive and verify terminal UIs headlessly**, so an agent (or a test, or CI) can
 operate a TUI the way a user does: press real keys, then read real state.
 
-> **Status:** v0.1.0, published on [crates.io](https://crates.io/crates/panedrive).
+> **Status:** v0.1.2, published on [crates.io](https://crates.io/crates/panedrive).
 > Two backends are proven live: tmux (attach to a running pane) and PTY (spawn a
-> TUI with no multiplexer, behind the `pty` feature). The state seam and condition
-> engine are covered at ~90%, and the CLI's exit-code contract is
-> integration-tested.
+> TUI with no multiplexer, behind the `pty` feature); zellij and GNU screen also
+> ship. panedrive speaks machine-readable JSON (`--json`, `run --events`), records
+> asciinema casts (`--cast`), and can capture a live session into a script
+> (`record`). The state seam and condition engine are covered at ~90%, and the
+> CLI's exit-code contract is integration-tested.
 
 ## Install
 
@@ -111,6 +113,9 @@ panedrive wait-until "focus=fleet" --state run.state.json --timeout-ms 5000
 # one-shot assertion (exit 0 held, 1 failed), usable as a CI gate
 panedrive assert "bag.count=2" --state run.state.json
 
+# see what you can assert on: every dot-path in the seam, with its type
+panedrive state --state run.state.json --paths
+
 # record the state timeline over a window, one JSONL line per change with
 # --distinct (catches transitions a single assert would miss)
 panedrive watch --state run.state.json --for-ms 10000 --interval-ms 200 --distinct
@@ -118,6 +123,10 @@ panedrive watch --state run.state.json --for-ms 10000 --interval-ms 200 --distin
 
 Exit codes: `0` success or held, `1` condition failed or timed out, `2` usage or
 backend error.
+
+Every command that takes `--state` also reads `$PANEDRIVE_STATE` as its default,
+so the app's snapshot writer and the driver can share one path (`export
+PANEDRIVE_STATE=run.state.json`) instead of hand-syncing it.
 
 ### Scripts (`run`)
 
@@ -177,6 +186,37 @@ uninstrumented app. Less precise than a real seam, but it degrades gracefully.
 
 Equality is numeric-aware: `count=2` matches a JSON `2` or `2.0` (and `1e3`
 matches `1000`); non-numeric scalars compare as text.
+
+When a condition fails, panedrive tells you what the seam actually held, not just
+that it failed:
+
+```text
+assert failed: count=2 (count was 1)
+```
+
+### Machine-readable output, casts, and recording
+
+Built for CI and agents, not just humans:
+
+- **`--json`** on `assert`, `wait-until`, and `run` emits a result object on
+  stdout (exit codes unchanged), so a caller gets `{ok, cond, actual, ...}` (and
+  for `run`, a per-step `steps` array) without parsing prose.
+- **`run --events <path>`** writes a timestamped JSONL track, one line per step
+  with its outcome, for feeding a pipeline or aligning a cast. Secrets from
+  `type --from-env` are never recorded.
+- **`run --cast <path>`** records an [asciinema](https://asciinema.org) v2 cast
+  of the session, so a failed run leaves a replayable artifact. Supported on the
+  **pty** backend (native) and **tmux** (via `pipe-pane`); screen and zellij
+  expose only snapshots, so they are rejected rather than faked.
+- **`validate-seam <file>`** checks a JSON document against the seam contract
+  (object root, scalar leaves), for bringing up a non-Rust adapter; `--json` too.
+- **`record`** (pty feature) spawns a program, forwards your keystrokes to it,
+  and writes what you pressed as a `.pds` script, so you can drive a session by
+  hand once and replay it forever (`--cast` records it too; Ctrl-] stops):
+
+  ```bash
+  panedrive record --script login.pds --cast login.cast -- ./my-tui
+  ```
 
 ## Secrets
 
