@@ -188,6 +188,26 @@ enum Cmd {
         #[arg(long)]
         cast: Option<PathBuf>,
     },
+    /// Record an interactive session into a script: spawn a program in a PTY,
+    /// forward your keystrokes to it, and write what you pressed as a `.pds`.
+    /// Press Ctrl-] to stop. Requires building with `--features pty`.
+    Record {
+        /// Where to write the recorded script.
+        #[arg(long)]
+        script: PathBuf,
+        /// Also record an asciinema v2 cast of the session to this path.
+        #[arg(long)]
+        cast: Option<PathBuf>,
+        /// Rows of the spawned pseudo-terminal.
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        /// Columns of the spawned pseudo-terminal.
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        /// The program to spawn and its args, given after `--`.
+        #[arg(last = true)]
+        program: Vec<String>,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -512,7 +532,123 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+        Cmd::Record {
+            script,
+            cast,
+            rows,
+            cols,
+            program,
+        } => spawn_record(script, cast, rows, cols, program),
     }
+}
+
+/// Record an interactive PTY session into a `.pds` script (and optionally a
+/// cast): spawn the program, mirror its output to our terminal, forward the
+/// user's keystrokes to it, and decode those keystrokes into script steps.
+#[cfg(feature = "pty")]
+fn spawn_record(
+    script_path: PathBuf,
+    cast: Option<PathBuf>,
+    rows: u16,
+    cols: u16,
+    program: Vec<String>,
+) -> anyhow::Result<ExitCode> {
+    use panedrive::backend::pty::OutputTap;
+    use std::io::IsTerminal;
+
+    let (prog, args) = program.split_first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "record needs a program after `--`, e.g. `record --script out.pds -- mytui`"
+        )
+    })?;
+    let prog = resolve_pty_program(prog);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    // Mirror the child's output to our stdout (so the user sees the UI) and,
+    // when asked, into an asciinema cast, all from the reader thread's tap.
+    let mut cast_writer = match &cast {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|e| anyhow::anyhow!("creating cast file {}: {e}", path.display()))?;
+            Some(panedrive::CastWriter::new(file, cols, rows)?)
+        }
+        None => None,
+    };
+    let tap: OutputTap = Box::new(move |bytes: &[u8]| {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+        if let Some(w) = cast_writer.as_mut() {
+            let _ = w.write_output(bytes);
+        }
+    });
+    let backend = panedrive::PtyBackend::spawn_tapped(&prog, &arg_refs, rows, cols, Some(tap))?;
+
+    // Put the terminal in raw mode so individual keystrokes reach us (skipped
+    // when stdin is piped, which is how the loop is exercised in tests).
+    let is_tty = std::io::stdin().is_terminal();
+    let saved_tty = if is_tty {
+        let s = stty_capture(&["-g"]).ok();
+        let _ = std::process::Command::new("stty")
+            .args(["raw", "-echo"])
+            .status();
+        eprintln!("recording… press Ctrl-] to stop");
+        s
+    } else {
+        None
+    };
+
+    let mut recorder = panedrive::ScriptRecorder::new();
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break, // EOF (piped input or closed terminal)
+            Ok(_) => {
+                if byte[0] == panedrive::record::STOP_BYTE {
+                    break;
+                }
+                let _ = backend.write_bytes(&byte);
+                recorder.feed(&byte);
+                if !backend.is_alive() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Restore the terminal before printing our summary.
+    if let Some(s) = saved_tty {
+        let _ = std::process::Command::new("stty").arg(s.trim()).status();
+    }
+
+    let text = recorder.finish();
+    std::fs::write(&script_path, &text)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", script_path.display()))?;
+    eprintln!(
+        "wrote {} step line(s) to {}",
+        text.lines().count(),
+        script_path.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "pty")]
+fn stty_capture(args: &[&str]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("stty").args(args).output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(feature = "pty"))]
+fn spawn_record(
+    _script_path: PathBuf,
+    _cast: Option<PathBuf>,
+    _rows: u16,
+    _cols: u16,
+    _program: Vec<String>,
+) -> anyhow::Result<ExitCode> {
+    anyhow::bail!("record spawns a program in a PTY, so it requires building with `--features pty`")
 }
 
 /// Render an observed path value as JSON for `--json` output: the scalar text,

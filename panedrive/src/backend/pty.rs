@@ -104,6 +104,17 @@ impl PtyBackend {
         })
     }
 
+    /// Write raw bytes straight to the child's PTY (bypassing key encoding),
+    /// used by `record` to forward the user's keystrokes verbatim.
+    pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("pty writer poisoned"))?;
+        w.write_all(bytes)?;
+        w.flush()
+    }
+
     /// Whether the child is still running.
     pub fn is_alive(&self) -> bool {
         match self.child.lock() {
