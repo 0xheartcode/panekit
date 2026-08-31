@@ -183,6 +183,10 @@ enum Cmd {
         /// path, for aligning a `--cast` recording or feeding CI/an agent.
         #[arg(long)]
         events: Option<PathBuf>,
+        /// Record an asciinema v2 cast to this path. Supported on the pty and
+        /// tmux backends (which expose a byte stream); not screen or zellij.
+        #[arg(long)]
+        cast: Option<PathBuf>,
     },
 }
 
@@ -418,11 +422,35 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             from_capture,
             json,
             events,
+            cast,
         } => {
+            if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
+                anyhow::bail!("--cast is supported on the pty and tmux backends only");
+            }
             let text = std::fs::read_to_string(&script)
                 .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
             let steps = parse_script(&text)?;
-            let backend = run_backend(backend, pane, program, rows, cols)?;
+            // The pty backend records via an output tap; tmux records via a
+            // pipe-pane recorder started below. Route the cast path accordingly.
+            let pty_cast = matches!(backend, Backend::Pty)
+                .then(|| cast.clone())
+                .flatten();
+            let pane_for_cast = pane.clone();
+            let backend_kind = backend;
+            let backend = run_backend(backend, pane, program, rows, cols, pty_cast)?;
+            // Start the tmux cast recorder (only for tmux + --cast).
+            let mut tmux_recorder = match (backend_kind, &cast) {
+                (Backend::Tmux, Some(path)) => {
+                    let pane = pane_for_cast.ok_or_else(|| {
+                        anyhow::anyhow!("--pane is required to record a tmux cast")
+                    })?;
+                    let file = std::fs::File::create(path).map_err(|e| {
+                        anyhow::anyhow!("creating cast file {}: {e}", path.display())
+                    })?;
+                    Some(panedrive::TmuxCastRecorder::start(pane, file)?)
+                }
+                _ => None,
+            };
             let b: &dyn PaneBackend = backend.as_ref();
             let settle = settle.then(|| Duration::from_millis(1000));
             // Read state from the JSON seam, or, with --from-capture, from the
@@ -456,6 +484,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     }
                 },
             )?;
+            // Flush and finalize the tmux cast (drops the pipe, joins the tail).
+            if let Some(r) = tmux_recorder.as_mut() {
+                r.stop();
+            }
             let steps_json: Vec<Value> = collected.iter().map(RunEvent::to_json).collect();
             match outcome {
                 RunResult::Passed => {
@@ -543,6 +575,7 @@ fn run_backend(
     program: Vec<String>,
     rows: u16,
     cols: u16,
+    cast: Option<PathBuf>,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     match backend {
         Backend::Tmux => {
@@ -562,12 +595,19 @@ fn run_backend(
             })?;
             Ok(Box::new(ScreenBackend::new(session)))
         }
-        Backend::Pty => spawn_pty(program, rows, cols),
+        Backend::Pty => spawn_pty(program, rows, cols, cast),
     }
 }
 
 #[cfg(feature = "pty")]
-fn spawn_pty(program: Vec<String>, rows: u16, cols: u16) -> anyhow::Result<Box<dyn PaneBackend>> {
+fn spawn_pty(
+    program: Vec<String>,
+    rows: u16,
+    cols: u16,
+    cast: Option<PathBuf>,
+) -> anyhow::Result<Box<dyn PaneBackend>> {
+    use panedrive::backend::pty::OutputTap;
+
     let (prog, args) = program.split_first().ok_or_else(|| {
         anyhow::anyhow!(
             "the pty backend needs a program after `--`, e.g. `run s --backend pty -- mytui`"
@@ -579,8 +619,21 @@ fn spawn_pty(program: Vec<String>, rows: u16, cols: u16) -> anyhow::Result<Box<d
     // way a shell user expects; leave bare names for the PATH lookup.
     let prog = resolve_pty_program(prog);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    Ok(Box::new(panedrive::PtyBackend::spawn(
-        &prog, &arg_refs, rows, cols,
+    // With --cast, tap the raw output into an asciinema recording. The cast's
+    // dimensions match the PTY we spawn.
+    let tap: Option<OutputTap> = match cast {
+        Some(path) => {
+            let file = std::fs::File::create(&path)
+                .map_err(|e| anyhow::anyhow!("creating cast file {}: {e}", path.display()))?;
+            let mut writer = panedrive::CastWriter::new(file, cols, rows)?;
+            Some(Box::new(move |bytes: &[u8]| {
+                let _ = writer.write_output(bytes);
+            }))
+        }
+        None => None,
+    };
+    Ok(Box::new(panedrive::PtyBackend::spawn_tapped(
+        &prog, &arg_refs, rows, cols, tap,
     )?))
 }
 
@@ -601,6 +654,7 @@ fn spawn_pty(
     _program: Vec<String>,
     _rows: u16,
     _cols: u16,
+    _cast: Option<PathBuf>,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     anyhow::bail!("the pty backend requires building panedrive with `--features pty`")
 }

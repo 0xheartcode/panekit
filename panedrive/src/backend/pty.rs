@@ -26,10 +26,27 @@ pub struct PtyBackend {
     _reader: JoinHandle<()>,
 }
 
+/// A sink for the PTY's raw output bytes, called on the reader thread for every
+/// chunk as it arrives. Used to record an asciinema cast alongside driving.
+pub type OutputTap = Box<dyn FnMut(&[u8]) + Send>;
+
 impl PtyBackend {
     /// Spawn `program args...` in a fresh `rows`×`cols` PTY and start reading
     /// its output into the screen model.
     pub fn spawn(program: &str, args: &[&str], rows: u16, cols: u16) -> io::Result<Self> {
+        Self::spawn_tapped(program, args, rows, cols, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), but also forward every raw output chunk to
+    /// `tap` as it is read (in addition to feeding the `vt100` screen model), so
+    /// a recorder can capture the byte stream this process already owns.
+    pub fn spawn_tapped(
+        program: &str,
+        args: &[&str],
+        rows: u16,
+        cols: u16,
+        mut tap: Option<OutputTap>,
+    ) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -69,6 +86,9 @@ impl PtyBackend {
                     Ok(n) => {
                         if let Ok(mut parser) = sink.lock() {
                             parser.process(&buf[..n]);
+                        }
+                        if let Some(tap) = tap.as_mut() {
+                            tap(&buf[..n]);
                         }
                     }
                 }

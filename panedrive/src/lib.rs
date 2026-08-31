@@ -13,6 +13,7 @@
 //! `docs/ARCHITECTURE.md`.
 
 pub mod backend;
+pub mod cast;
 pub mod condition;
 pub mod driver;
 pub mod key;
@@ -22,6 +23,7 @@ pub mod seam;
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;
 pub use backend::{PaneBackend, screen::ScreenBackend, tmux::TmuxBackend, zellij::ZellijBackend};
+pub use cast::{CastWriter, TmuxCastRecorder};
 pub use condition::{Condition, NumOp, Observed};
 pub use driver::{WaitOutcome, read_state_file, screen_state, wait_until, watch};
 pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
