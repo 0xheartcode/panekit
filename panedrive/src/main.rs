@@ -613,7 +613,6 @@ fn spawn_record(
     program: Vec<String>,
 ) -> anyhow::Result<ExitCode> {
     use panedrive::backend::pty::OutputTap;
-    use std::io::IsTerminal;
 
     let (prog, args) = program.split_first().ok_or_else(|| {
         anyhow::anyhow!(
@@ -644,18 +643,10 @@ fn spawn_record(
     let backend = panedrive::PtyBackend::spawn_tapped(&prog, &arg_refs, rows, cols, Some(tap))?;
 
     // Put the terminal in raw mode so individual keystrokes reach us (skipped
-    // when stdin is piped, which is how the loop is exercised in tests).
-    let is_tty = std::io::stdin().is_terminal();
-    let saved_tty = if is_tty {
-        let s = stty_capture(&["-g"]).ok();
-        let _ = std::process::Command::new("stty")
-            .args(["raw", "-echo"])
-            .status();
-        eprintln!("recording… press Ctrl-] to stop");
-        s
-    } else {
-        None
-    };
+    // when stdin is piped, which is how the loop is exercised in tests). The
+    // guard restores the terminal on drop, so raw mode never leaks even if the
+    // record loop panics between here and the explicit restore below.
+    let restore = TerminalRestore::raw();
 
     let mut recorder = panedrive::ScriptRecorder::new();
     let mut stdin = std::io::stdin().lock();
@@ -677,10 +668,9 @@ fn spawn_record(
         }
     }
 
-    // Restore the terminal before printing our summary.
-    if let Some(s) = saved_tty {
-        let _ = std::process::Command::new("stty").arg(s.trim()).status();
-    }
+    // Restore the terminal before printing our summary (Drop would do it at
+    // scope end regardless, but we want cooked mode back before the eprintln).
+    drop(restore);
 
     let text = recorder.finish();
     std::fs::write(&script_path, &text)
@@ -691,6 +681,40 @@ fn spawn_record(
         script_path.display()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// An RAII guard that puts the terminal in raw mode and restores it on drop, so
+/// `record` can never leave the user's terminal in raw mode, not even if the
+/// record loop panics. A no-op when stdin is not a TTY (piped input, as in the
+/// integration test), where there is nothing to restore.
+#[cfg(feature = "pty")]
+struct TerminalRestore {
+    saved: Option<String>,
+}
+
+#[cfg(feature = "pty")]
+impl TerminalRestore {
+    fn raw() -> Self {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Self { saved: None };
+        }
+        let saved = stty_capture(&["-g"]).ok();
+        let _ = std::process::Command::new("stty")
+            .args(["raw", "-echo"])
+            .status();
+        eprintln!("recording… press Ctrl-] to stop");
+        Self { saved }
+    }
+}
+
+#[cfg(feature = "pty")]
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        if let Some(s) = self.saved.take() {
+            let _ = std::process::Command::new("stty").arg(s.trim()).status();
+        }
+    }
 }
 
 #[cfg(feature = "pty")]
