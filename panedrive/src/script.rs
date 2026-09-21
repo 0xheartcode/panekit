@@ -266,67 +266,115 @@ pub fn parse_script(text: &str) -> anyhow::Result<Vec<Step>> {
     Ok(steps)
 }
 
-/// Run every step in order against `backend`, reading state through `probe` and
-/// sending `capture` output to `emit`. Stops at the first failing assertion or
-/// timeout with [`RunResult::Failed`]; a backend error is returned as `Err`.
-pub fn run_script<P, E>(
-    steps: &[Step],
-    backend: &dyn PaneBackend,
-    probe: P,
-    emit: E,
-) -> anyhow::Result<RunResult>
-where
-    P: FnMut() -> Option<Value>,
-    E: FnMut(&str),
-{
-    run_script_settling(steps, backend, None, probe, emit)
+/// Options that control how a script runs.
+#[derive(Debug, Default, Clone)]
+pub struct RunOptions {
+    /// When `Some(timeout)`, each key/`type` step waits up to `timeout` for the
+    /// seam to change before the next step runs. This absorbs the asynchronous
+    /// gap between a keypress and the UI writing its next snapshot, so a
+    /// following `assert` does not race a stale seam. `None` disables settling.
+    pub settle: Option<Duration>,
 }
 
-/// Like [`run_script`], but when `settle` is `Some(timeout)` each key/type step
-/// waits (up to `timeout`) for the seam to change before the next step. This
-/// absorbs the asynchronous gap between a keypress and the UI writing its next
-/// snapshot, so a following `assert` does not race a stale seam.
-pub fn run_script_settling<P, E>(
-    steps: &[Step],
-    backend: &dyn PaneBackend,
-    settle: Option<Duration>,
-    probe: P,
-    emit: E,
-) -> anyhow::Result<RunResult>
-where
-    P: FnMut() -> Option<Value>,
-    E: FnMut(&str),
-{
-    run_script_recording(steps, backend, settle, probe, emit, |_| {})
+impl RunOptions {
+    /// Default options: no settling.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable settling, waiting up to `timeout` after each mutating step.
+    pub fn with_settle(mut self, timeout: Duration) -> Self {
+        self.settle = Some(timeout);
+        self
+    }
 }
 
-/// Like [`run_script_settling`], but also hands every executed step to
-/// `on_event` as a [`RunEvent`] (timestamped, with the assertion outcome). This
-/// is what powers the `--events` track and the `--json` run summary; the events
-/// are emitted as the run progresses, so the sink sees the failing step too.
-pub fn run_script_recording<P, E, V>(
-    steps: &[Step],
-    backend: &dyn PaneBackend,
-    settle: Option<Duration>,
-    mut probe: P,
-    mut emit: E,
-    mut on_event: V,
-) -> anyhow::Result<RunResult>
+/// The channels a running script reads and reports through: the state `probe`
+/// (the source of seam values), the `emit` sink that receives `capture` output,
+/// and the `on_event` sink that observes every executed [`RunEvent`]. Only
+/// `probe` is required; the two reporting hooks default to no-ops, so a caller
+/// that just wants a pass/fail verdict implements a single method.
+pub trait RunSink {
+    /// Read the current state seam, or `None` when it is not readable yet.
+    fn probe(&mut self) -> Option<Value>;
+    /// Receive the visible pane text produced by a `capture` step.
+    fn emit(&mut self, _screen: &str) {}
+    /// Observe a completed step, in order, including the step that fails.
+    fn on_event(&mut self, _event: &RunEvent) {}
+}
+
+/// A [`RunSink`] assembled from closures, for callers that would rather not
+/// define their own type. Use [`ClosureSink::new`] to wire all three channels,
+/// or [`probe_sink`] when only the state probe matters.
+pub struct ClosureSink<P, E, V> {
+    probe: P,
+    emit: E,
+    on_event: V,
+}
+
+impl<P, E, V> ClosureSink<P, E, V>
 where
     P: FnMut() -> Option<Value>,
     E: FnMut(&str),
     V: FnMut(&RunEvent),
 {
+    /// Wire a sink from a state probe, a capture emitter, and an event observer.
+    pub fn new(probe: P, emit: E, on_event: V) -> Self {
+        Self {
+            probe,
+            emit,
+            on_event,
+        }
+    }
+}
+
+impl<P, E, V> RunSink for ClosureSink<P, E, V>
+where
+    P: FnMut() -> Option<Value>,
+    E: FnMut(&str),
+    V: FnMut(&RunEvent),
+{
+    fn probe(&mut self) -> Option<Value> {
+        (self.probe)()
+    }
+    fn emit(&mut self, screen: &str) {
+        (self.emit)(screen)
+    }
+    fn on_event(&mut self, event: &RunEvent) {
+        (self.on_event)(event)
+    }
+}
+
+/// A [`RunSink`] that only reads state through `probe`, ignoring capture output
+/// and events, for a plain pass/fail run.
+pub fn probe_sink<P>(probe: P) -> ClosureSink<P, impl FnMut(&str), impl FnMut(&RunEvent)>
+where
+    P: FnMut() -> Option<Value>,
+{
+    ClosureSink::new(probe, |_screen: &str| {}, |_event: &RunEvent| {})
+}
+
+/// Run every step in order against `backend`, reading state and reporting
+/// progress through `sink`, under `opts`. Stops at the first failing assertion
+/// or timed-out `wait-until` with [`RunResult::Failed`] (exit 1); a backend or
+/// usage error is returned as `Err` (exit 2); otherwise [`RunResult::Passed`].
+pub fn run_script(
+    steps: &[Step],
+    backend: &dyn PaneBackend,
+    opts: &RunOptions,
+    sink: &mut dyn RunSink,
+) -> anyhow::Result<RunResult> {
+    let settle = opts.settle;
     let run_start = Instant::now();
     let t_ms = |start: Instant| start.elapsed().as_millis() as u64;
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         match step {
             Step::Press(keys) => {
-                let before = if settle.is_some() { probe() } else { None };
+                let before = if settle.is_some() { sink.probe() } else { None };
                 backend.send_keys(keys)?;
-                settle_after(settle, &before, &mut probe);
-                on_event(&RunEvent {
+                settle_after(settle, &before, sink);
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "press",
@@ -342,20 +390,20 @@ where
                         anyhow::anyhow!("step {n}: environment variable {var} is not set")
                     })?,
                 };
-                let before = if settle.is_some() { probe() } else { None };
+                let before = if settle.is_some() { sink.probe() } else { None };
                 if *paste {
                     backend.paste_text(&text)?;
                 } else {
                     let keys: Vec<Key> = text.chars().map(Key::Char).collect();
                     backend.send_keys(&keys)?;
                 }
-                settle_after(settle, &before, &mut probe);
+                settle_after(settle, &before, sink);
                 // Never log the secret itself: record the source, not the value.
                 let detail = match source {
                     TypeSource::Literal(s) => s.clone(),
                     TypeSource::FromEnv(var) => format!("--from-env {var}"),
                 };
-                on_event(&RunEvent {
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "type",
@@ -366,7 +414,7 @@ where
             }
             Step::Sleep(d) => {
                 std::thread::sleep(*d);
-                on_event(&RunEvent {
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "sleep",
@@ -376,8 +424,8 @@ where
                 });
             }
             Step::Capture => {
-                emit(&backend.capture()?);
-                on_event(&RunEvent {
+                sink.emit(&backend.capture()?);
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "capture",
@@ -387,11 +435,11 @@ where
                 });
             }
             Step::Assert(cond) => {
-                let (ok, observed, has_state) = match probe() {
+                let (ok, observed, has_state) = match sink.probe() {
                     Some(v) => (cond.eval(&v), cond.observed(&v), true),
                     None => (false, Observed::Missing, false),
                 };
-                on_event(&RunEvent {
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "assert",
@@ -419,13 +467,14 @@ where
                 timeout,
                 interval,
             } => {
-                let outcome = wait_until(cond, *timeout, *interval, &mut probe);
+                let outcome = wait_until(cond, *timeout, *interval, || sink.probe());
                 let ok = outcome.is_satisfied();
                 // A final probe gives the event/failure the last observed value.
-                let observed = probe()
+                let observed = sink
+                    .probe()
                     .map(|v| cond.observed(&v))
                     .unwrap_or(Observed::Missing);
-                on_event(&RunEvent {
+                sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
                     kind: "wait-until",
@@ -453,14 +502,11 @@ where
 
 /// After a mutating step, poll the seam until it differs from `before` (or the
 /// settle timeout elapses). A no-op when `settle` is `None`.
-fn settle_after<P>(settle: Option<Duration>, before: &Option<Value>, probe: &mut P)
-where
-    P: FnMut() -> Option<Value>,
-{
+fn settle_after(settle: Option<Duration>, before: &Option<Value>, sink: &mut dyn RunSink) {
     let Some(timeout) = settle else { return };
     let start = Instant::now();
     loop {
-        if probe().as_ref() != before.as_ref() {
+        if sink.probe().as_ref() != before.as_ref() {
             return;
         }
         if start.elapsed() >= timeout {
@@ -771,24 +817,49 @@ mod tests {
         }
     }
 
+    /// A `RunSink` that reads state through a probe closure and keeps every
+    /// capture line and event it is handed, so a test can inspect them after the
+    /// run (unlike bare closures, it owns its buffers past the borrow).
+    struct TestSink<P: FnMut() -> Option<Value>> {
+        probe: P,
+        captured: Vec<String>,
+        events: Vec<RunEvent>,
+    }
+
+    impl<P: FnMut() -> Option<Value>> TestSink<P> {
+        fn new(probe: P) -> Self {
+            Self {
+                probe,
+                captured: Vec::new(),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl<P: FnMut() -> Option<Value>> RunSink for TestSink<P> {
+        fn probe(&mut self) -> Option<Value> {
+            (self.probe)()
+        }
+        fn emit(&mut self, screen: &str) {
+            self.captured.push(screen.to_string());
+        }
+        fn on_event(&mut self, event: &RunEvent) {
+            self.events.push(event.clone());
+        }
+    }
+
     #[test]
     fn run_passes_when_every_step_holds() {
         let steps = parse_script("press a\ntype hi\nassert ready=true\ncapture").unwrap();
         let backend = mock();
-        let mut captured = Vec::new();
-        let out = run_script(
-            &steps,
-            &backend,
-            || Some(json!({ "ready": true })),
-            |s| captured.push(s.to_string()),
-        )
-        .unwrap();
+        let mut sink = TestSink::new(|| Some(json!({ "ready": true })));
+        let out = run_script(&steps, &backend, &RunOptions::new(), &mut sink).unwrap();
         assert_eq!(out, RunResult::Passed);
         assert_eq!(
             *backend.sent.borrow(),
             vec![Key::Char('a'), Key::Char('h'), Key::Char('i')]
         );
-        assert_eq!(captured, vec!["SCREEN".to_string()]);
+        assert_eq!(sink.captured, vec!["SCREEN".to_string()]);
     }
 
     #[test]
@@ -800,7 +871,7 @@ mod tests {
         // keystroke path: chars are sent one by one
         let keyed = mock();
         let steps = parse_script("type --from-env PANEDRIVE_TEST_SECRET").unwrap();
-        run_script(&steps, &keyed, || None, |_| {}).unwrap();
+        run_script(&steps, &keyed, &RunOptions::new(), &mut probe_sink(|| None)).unwrap();
         assert_eq!(
             *keyed.sent.borrow(),
             "s3cr3t".chars().map(Key::Char).collect::<Vec<_>>()
@@ -810,7 +881,13 @@ mod tests {
         // paste path: routed through paste_text, not send_keys
         let pasted = mock();
         let steps = parse_script("type --paste --from-env PANEDRIVE_TEST_SECRET").unwrap();
-        run_script(&steps, &pasted, || None, |_| {}).unwrap();
+        run_script(
+            &steps,
+            &pasted,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap();
         assert_eq!(*pasted.pasted.borrow(), vec!["s3cr3t".to_string()]);
         assert!(pasted.sent.borrow().is_empty());
 
@@ -822,7 +899,12 @@ mod tests {
     #[test]
     fn run_errors_when_the_secret_env_var_is_unset() {
         let steps = parse_script("type --from-env PANEDRIVE_DEFINITELY_UNSET").unwrap();
-        let out = run_script(&steps, &mock(), || None, |_| {});
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        );
         assert!(
             out.is_err(),
             "an unset env var must be an error, not a pass"
@@ -832,29 +914,40 @@ mod tests {
     #[test]
     fn settle_waits_for_the_seam_to_change_before_the_next_step() {
         use std::cell::Cell;
-        // The seam reads v=0 on the first probe (the pre-press snapshot) and
-        // v=1 afterwards, modelling the app writing its update slightly late.
+        // The seam holds v=0 for the pre-press snapshot AND the first couple of
+        // settle polls, only flipping to v=1 on the fourth read. This models the
+        // app writing its update several polls late, and — crucially — it makes
+        // the test able to tell a real settle loop from a broken one: a settle
+        // that never polls, or that treats "unchanged" as done, or that exits
+        // before the change, leaves the following `assert` reading the stale
+        // v=0 and the run Fails. Only a genuine poll-until-changed reaches v=1.
+        // (A probe that advanced on every call could not distinguish these.)
         let make_probe = || {
             let n = Cell::new(0);
             move || {
                 let i = n.get();
                 n.set(i + 1);
-                Some(json!({ "v": if i == 0 { 0 } else { 1 } }))
+                Some(json!({ "v": if i < 3 { 0 } else { 1 } }))
             }
         };
         let steps = parse_script("press a\nassert v=1").unwrap();
 
         // Without settle, the assert races and reads the stale v=0.
-        let out = run_script(&steps, &mock(), make_probe(), |_| {}).unwrap();
-        assert!(matches!(out, RunResult::Failed(_)), "no settle should race");
-
-        // With settle, the press waits for v to change, so the assert holds.
-        let out = run_script_settling(
+        let out = run_script(
             &steps,
             &mock(),
-            Some(Duration::from_secs(1)),
-            make_probe(),
-            |_| {},
+            &RunOptions::new(),
+            &mut probe_sink(make_probe()),
+        )
+        .unwrap();
+        assert!(matches!(out, RunResult::Failed(_)), "no settle should race");
+
+        // With settle, the press polls until v changes, so the assert holds.
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_settle(Duration::from_secs(1)),
+            &mut probe_sink(make_probe()),
         )
         .unwrap();
         assert_eq!(out, RunResult::Passed, "settle should absorb the async gap");
@@ -863,14 +956,26 @@ mod tests {
     #[test]
     fn run_fails_on_assert_mismatch() {
         let steps = parse_script("assert ready=true").unwrap();
-        let out = run_script(&steps, &mock(), || Some(json!({ "ready": false })), |_| {}).unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": false }))),
+        )
+        .unwrap();
         assert!(matches!(out, RunResult::Failed(_)));
     }
 
     #[test]
     fn failed_assert_carries_the_observed_value() {
         let steps = parse_script("assert count=2").unwrap();
-        let out = run_script(&steps, &mock(), || Some(json!({ "count": 1 })), |_| {}).unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "count": 1 }))),
+        )
+        .unwrap();
         let RunResult::Failed(f) = out else {
             panic!("expected a failure");
         };
@@ -894,17 +999,10 @@ mod tests {
     #[test]
     fn recording_emits_one_event_per_step_with_outcomes() {
         let steps = parse_script("press Down\nassert count=1").unwrap();
-        let mut events: Vec<RunEvent> = Vec::new();
-        let out = run_script_recording(
-            &steps,
-            &mock(),
-            None,
-            || Some(json!({ "count": 1 })),
-            |_| {},
-            |e| events.push(e.clone()),
-        )
-        .unwrap();
+        let mut sink = TestSink::new(|| Some(json!({ "count": 1 })));
+        let out = run_script(&steps, &mock(), &RunOptions::new(), &mut sink).unwrap();
         assert_eq!(out, RunResult::Passed);
+        let events = &sink.events;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, "press");
         assert_eq!(events[0].detail, "Down");
@@ -920,19 +1018,12 @@ mod tests {
             std::env::set_var("PANEDRIVE_TEST_SECRET2", "hunter2");
         }
         let steps = parse_script("type --from-env PANEDRIVE_TEST_SECRET2").unwrap();
-        let mut events: Vec<RunEvent> = Vec::new();
-        run_script_recording(
-            &steps,
-            &mock(),
-            None,
-            || None,
-            |_| {},
-            |e| events.push(e.clone()),
-        )
-        .unwrap();
+        let mut sink = TestSink::new(|| None);
+        run_script(&steps, &mock(), &RunOptions::new(), &mut sink).unwrap();
         unsafe {
             std::env::remove_var("PANEDRIVE_TEST_SECRET2");
         }
+        let events = &sink.events;
         assert_eq!(events[0].kind, "type");
         assert_eq!(events[0].detail, "--from-env PANEDRIVE_TEST_SECRET2");
         assert!(
@@ -944,7 +1035,13 @@ mod tests {
     #[test]
     fn run_fails_on_assert_without_state() {
         let steps = parse_script("assert ready=true").unwrap();
-        let out = run_script(&steps, &mock(), || None, |_| {}).unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap();
         assert!(matches!(
             out,
             RunResult::Failed(f) if matches!(f.reason, FailReason::NoState)
@@ -1025,21 +1122,13 @@ mod tests {
     #[test]
     fn recording_reports_timeout_with_last_observed() {
         let steps = parse_script("wait-until ready=true --timeout-ms 5 --interval-ms 1").unwrap();
-        let mut events: Vec<RunEvent> = Vec::new();
-        let out = run_script_recording(
-            &steps,
-            &mock(),
-            None,
-            || Some(json!({ "ready": false })),
-            |_| {},
-            |e| events.push(e.clone()),
-        )
-        .unwrap();
+        let mut sink = TestSink::new(|| Some(json!({ "ready": false })));
+        let out = run_script(&steps, &mock(), &RunOptions::new(), &mut sink).unwrap();
         let RunResult::Failed(f) = out else {
             panic!("expected a timeout failure");
         };
         assert!(matches!(f.reason, FailReason::TimedOut { .. }));
-        let last = events.last().unwrap();
+        let last = sink.events.last().unwrap();
         assert_eq!(last.kind, "wait-until");
         assert_eq!(last.ok, Some(false));
     }
@@ -1047,7 +1136,13 @@ mod tests {
     #[test]
     fn run_fails_when_wait_until_times_out() {
         let steps = parse_script("wait-until ready=true --timeout-ms 5 --interval-ms 1").unwrap();
-        let out = run_script(&steps, &mock(), || Some(json!({ "ready": false })), |_| {}).unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": false }))),
+        )
+        .unwrap();
         assert!(matches!(
             out,
             RunResult::Failed(f) if matches!(f.reason, FailReason::TimedOut { .. })
@@ -1059,17 +1154,11 @@ mod tests {
         // The second step fails, so the third (capture) never runs.
         let steps = parse_script("press a\nassert ready=true\ncapture").unwrap();
         let backend = mock();
-        let mut captured = Vec::new();
-        let out = run_script(
-            &steps,
-            &backend,
-            || Some(json!({ "ready": false })),
-            |s| captured.push(s.to_string()),
-        )
-        .unwrap();
+        let mut sink = TestSink::new(|| Some(json!({ "ready": false })));
+        let out = run_script(&steps, &backend, &RunOptions::new(), &mut sink).unwrap();
         assert!(matches!(out, RunResult::Failed(_)));
         assert!(
-            captured.is_empty(),
+            sink.captured.is_empty(),
             "capture after the failure must not run"
         );
     }
@@ -1086,7 +1175,12 @@ mod tests {
             }
         }
         let steps = parse_script("press a").unwrap();
-        let err = run_script(&steps, &Broken, || None, |_| {});
+        let err = run_script(
+            &steps,
+            &Broken,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        );
         assert!(err.is_err());
     }
 }

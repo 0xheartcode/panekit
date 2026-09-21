@@ -30,6 +30,6 @@ pub use driver::{WaitOutcome, read_state_file, screen_state, wait_until, watch};
 pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
 pub use record::ScriptRecorder;
 pub use script::{
-    FailReason, RunEvent, RunResult, Step, StepFailure, TypeSource, parse_script, run_script,
-    run_script_recording, run_script_settling,
+    ClosureSink, FailReason, RunEvent, RunOptions, RunResult, RunSink, Step, StepFailure,
+    TypeSource, parse_script, probe_sink, run_script,
 };

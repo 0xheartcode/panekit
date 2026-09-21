@@ -6,7 +6,9 @@
 
 #![cfg(feature = "pty")]
 
-use panedrive::{PtyBackend, RunResult, parse_script, read_state_file, run_script};
+use panedrive::{
+    PtyBackend, RunOptions, RunResult, parse_script, probe_sink, read_state_file, run_script,
+};
 use std::path::PathBuf;
 
 /// The `counter_tui` example binary sits next to the `panedrive` test binary,
@@ -44,8 +46,13 @@ fn run_drives_a_pty_spawned_tui_and_the_seam_moves() {
         assert last=inc\n";
     let steps = parse_script(script).expect("parse script");
 
-    let outcome =
-        run_script(&steps, &backend, || read_state_file(&state), |_| {}).expect("run script");
+    let outcome = run_script(
+        &steps,
+        &backend,
+        &RunOptions::new(),
+        &mut probe_sink(|| read_state_file(&state)),
+    )
+    .expect("run script");
 
     // Quit and clean up before asserting so a failure never leaks the file.
     let _ = backend.kill();

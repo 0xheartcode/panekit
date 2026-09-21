@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use panedrive::{
-    Key, Observed, PaneBackend, RunEvent, RunResult, ScreenBackend, TmuxBackend, WaitOutcome,
-    ZellijBackend, condition::Condition, driver, key, parse_script, run_script_recording, seam,
+    ClosureSink, Key, Observed, PaneBackend, RunEvent, RunOptions, RunResult, ScreenBackend,
+    TmuxBackend, WaitOutcome, ZellijBackend, condition::Condition, driver, key, parse_script,
+    run_script, seam,
 };
 use serde_json::Value;
 
@@ -472,7 +473,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 _ => None,
             };
             let b: &dyn PaneBackend = backend.as_ref();
-            let settle = settle.then(|| Duration::from_millis(1000));
+            let opts = RunOptions {
+                settle: settle.then(|| Duration::from_millis(1000)),
+            };
             // Read state from the JSON seam, or, with --from-capture, from the
             // pane's visible text wrapped as {screen, lines} for uninstrumented
             // apps.
@@ -489,21 +492,23 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     None => None,
                 };
             let mut collected: Vec<RunEvent> = Vec::new();
-            let outcome = run_script_recording(
-                &steps,
-                b,
-                settle,
-                &mut probe,
-                |screen| print!("{screen}"),
-                |e| {
-                    if let Some(f) = events_file.as_mut() {
-                        let _ = writeln!(f, "{}", e.to_json());
-                    }
-                    if json {
-                        collected.push(e.clone());
-                    }
-                },
-            )?;
+            // Scope the sink so its borrow of `collected`/`events_file` ends
+            // before we read `collected` for the summary below.
+            let outcome = {
+                let mut sink = ClosureSink::new(
+                    &mut probe,
+                    |screen: &str| print!("{screen}"),
+                    |e: &RunEvent| {
+                        if let Some(f) = events_file.as_mut() {
+                            let _ = writeln!(f, "{}", e.to_json());
+                        }
+                        if json {
+                            collected.push(e.clone());
+                        }
+                    },
+                );
+                run_script(&steps, b, &opts, &mut sink)?
+            };
             // Flush and finalize the tmux cast (drops the pipe, joins the tail).
             if let Some(r) = tmux_recorder.as_mut() {
                 r.stop();
