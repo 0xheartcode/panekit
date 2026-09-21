@@ -21,6 +21,7 @@ pub struct ScreenBackend {
 }
 
 impl ScreenBackend {
+    /// Drive the screen session with the given session name.
     pub fn new(session: impl Into<String>) -> Self {
         Self {
             session: session.into(),

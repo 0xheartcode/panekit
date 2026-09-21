@@ -23,6 +23,7 @@ pub struct ScriptRecorder {
 }
 
 impl ScriptRecorder {
+    /// Create an empty recorder with no buffered input.
     pub fn new() -> Self {
         Self::default()
     }

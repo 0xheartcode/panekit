@@ -11,6 +11,7 @@
 //! The split is deliberate: pairing tmux *input* with a JSON *state* seam gives
 //! you real-keybinding fidelity without the flakiness of screen-scraping. See
 //! `docs/ARCHITECTURE.md`.
+#![deny(missing_docs)]
 
 pub mod backend;
 pub mod cast;

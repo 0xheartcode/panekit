@@ -34,6 +34,7 @@ pub enum WaitOutcome {
 }
 
 impl WaitOutcome {
+    /// True when the condition held (as opposed to timing out).
     pub fn is_satisfied(&self) -> bool {
         matches!(self, WaitOutcome::Satisfied(_))
     }

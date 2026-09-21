@@ -39,20 +39,30 @@ const DEFAULT_INTERVAL_MS: u64 = 50;
 /// One parsed step of a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
+    /// Send a sequence of key presses.
     Press(Vec<Key>),
+    /// Type text into the pane, optionally via the paste transport.
     Type {
+        /// Where the text to type comes from.
         source: TypeSource,
         /// Route through the backend's paste transport (tmux buffer) instead of
         /// keystrokes, so a secret never transits `send-keys` argv.
         paste: bool,
     },
+    /// Poll the seam until a condition holds or the timeout elapses.
     WaitUntil {
+        /// The condition to wait for.
         cond: Condition,
+        /// How long to keep polling before giving up.
         timeout: Duration,
+        /// How long to sleep between seam reads.
         interval: Duration,
     },
+    /// Check a condition against the seam once.
     Assert(Condition),
+    /// Emit the pane's currently visible text.
     Capture,
+    /// Pause for the given duration.
     Sleep(Duration),
 }
 
@@ -96,11 +106,19 @@ pub struct StepFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailReason {
     /// The condition did not hold; `observed` is what the path resolved to.
-    Unmet { observed: Observed },
+    Unmet {
+        /// What the condition's path resolved to.
+        observed: Observed,
+    },
     /// There was no readable state seam to check against.
     NoState,
     /// A `wait-until` timed out; `observed` is the last thing the path held.
-    TimedOut { timeout_ms: u64, observed: Observed },
+    TimedOut {
+        /// The timeout that elapsed, in milliseconds.
+        timeout_ms: u64,
+        /// The last value the path held before the timeout.
+        observed: Observed,
+    },
 }
 
 impl StepFailure {

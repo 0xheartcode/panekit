@@ -9,13 +9,21 @@
 pub enum Key {
     /// A literal printable character.
     Char(char),
+    /// The Enter/Return key.
     Enter,
+    /// The Tab key.
     Tab,
+    /// The Backspace key.
     Backspace,
+    /// The Escape key.
     Esc,
+    /// The Up arrow key.
     Up,
+    /// The Down arrow key.
     Down,
+    /// The Left arrow key.
     Left,
+    /// The Right arrow key.
     Right,
     /// `Ctrl` + a letter, e.g. `Key::Ctrl('c')`.
     Ctrl(char),
@@ -25,7 +33,9 @@ pub enum Key {
 /// `C-c`) or a literal character sent with `-l`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxKey {
+    /// A named key token (`Enter`, `C-c`), passed to `send-keys` as-is.
     Named(String),
+    /// A literal character, sent with `send-keys -l`.
     Literal(char),
 }
 

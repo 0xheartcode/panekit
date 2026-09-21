@@ -24,7 +24,13 @@ Entries are kept on a single line each: cargo-dist injects this file into the Gi
 
 ### Changed
 
+- **Library API (breaking, pre-publish)**: the script runner is one deep function again, `run_script(steps, backend, &RunOptions, &mut dyn RunSink)`, replacing the `run_script` / `run_script_settling` / `run_script_recording` trio (a 6-arg widest form behind two forwarders). `RunOptions` carries settling; the `RunSink` trait bundles the state probe, capture output, and per-step event channels, with `ClosureSink` / `probe_sink` for closure callers. Reshaped now so 0.1.2 ships the clean surface rather than needing a later minor bump.
+- **`#![deny(missing_docs)]`** on both crates, with every public item documented, so the docs.rs pages are complete.
 - CHANGELOG: keep each entry on one line so the generated release notes render as flowing paragraphs instead of hard-wrapped fragments.
+
+### Fixed
+
+- **`record` terminal safety**: raw mode is now entered and restored through an RAII guard, so a panic in the record loop can no longer leave your terminal stuck in raw mode.
 
 ## [0.1.1] - 2026-08-28
 

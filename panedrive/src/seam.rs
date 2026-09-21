@@ -15,8 +15,11 @@ use serde_json::Value;
 /// type name (`string`, `number`, `bool`, `null`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leaf {
+    /// The dot-path that addresses this leaf.
     pub path: String,
+    /// The scalar's value in its textual form.
     pub value: String,
+    /// The scalar's JSON type name (`string`, `number`, `bool`, `null`).
     pub kind: &'static str,
 }
 

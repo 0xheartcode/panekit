@@ -21,9 +21,13 @@ use serde_json::Value;
 /// A numeric comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumOp {
+    /// Greater than (`>`).
     Gt,
+    /// Less than (`<`).
     Lt,
+    /// Greater than or equal (`>=`).
     Ge,
+    /// Less than or equal (`<=`).
     Le,
 }
 

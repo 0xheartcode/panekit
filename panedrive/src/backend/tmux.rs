@@ -16,6 +16,7 @@ pub struct TmuxBackend {
 }
 
 impl TmuxBackend {
+    /// Drive the tmux pane at the given target.
     pub fn new(pane: impl Into<String>) -> Self {
         Self { pane: pane.into() }
     }
