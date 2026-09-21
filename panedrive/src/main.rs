@@ -148,47 +148,7 @@ enum Cmd {
     /// program given after `--`. Steps: `press`, `type`, `wait-until`,
     /// `assert`, `capture`, `sleep`. Exit `0` if all pass, `1` if an assert or
     /// wait-until fails, `2` on a usage or backend error.
-    Run {
-        /// Path to the script file (one step per line; `#` comments allowed).
-        script: PathBuf,
-        #[arg(long, value_enum, default_value_t = Backend::Tmux)]
-        backend: Backend,
-        /// State seam path that `assert` / `wait-until` steps read (defaults to
-        /// $PANEDRIVE_STATE). Point the app's snapshot writer at the same path.
-        #[arg(long, env = "PANEDRIVE_STATE")]
-        state: Option<PathBuf>,
-        /// Target for the attach backends: a tmux pane, or a zellij session.
-        #[arg(long)]
-        pane: Option<String>,
-        /// pty only: the program to spawn and its args, given after `--`.
-        #[arg(last = true)]
-        program: Vec<String>,
-        /// pty only: rows of the spawned pseudo-terminal.
-        #[arg(long, default_value_t = 24)]
-        rows: u16,
-        /// pty only: columns of the spawned pseudo-terminal.
-        #[arg(long, default_value_t = 80)]
-        cols: u16,
-        /// After each key/type step, wait up to ~1s for the seam to change
-        /// before the next step, so an `assert` does not race a stale snapshot.
-        #[arg(long)]
-        settle: bool,
-        /// Evaluate conditions against the captured screen text (`screen`,
-        /// `lines.<n>`) instead of a JSON state file, for apps with no seam.
-        #[arg(long)]
-        from_capture: bool,
-        /// Emit a JSON run summary on stdout: `{ok, failed_step?, steps:[..]}`.
-        #[arg(long)]
-        json: bool,
-        /// Write a JSONL event track (one line per step, timestamped) to this
-        /// path, for aligning a `--cast` recording or feeding CI/an agent.
-        #[arg(long)]
-        events: Option<PathBuf>,
-        /// Record an asciinema v2 cast to this path. Supported on the pty and
-        /// tmux backends (which expose a byte stream); not screen or zellij.
-        #[arg(long)]
-        cast: Option<PathBuf>,
-    },
+    Run(RunArgs),
     /// Record an interactive session into a script: spawn a program in a PTY,
     /// forward your keystrokes to it, and write what you pressed as a `.pds`.
     /// Press Ctrl-] to stop. Requires building with `--features pty`.
@@ -209,6 +169,50 @@ enum Cmd {
         #[arg(last = true)]
         program: Vec<String>,
     },
+}
+
+/// Arguments to the `run` subcommand.
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Path to the script file (one step per line; `#` comments allowed).
+    script: PathBuf,
+    #[arg(long, value_enum, default_value_t = Backend::Tmux)]
+    backend: Backend,
+    /// State seam path that `assert` / `wait-until` steps read (defaults to
+    /// $PANEDRIVE_STATE). Point the app's snapshot writer at the same path.
+    #[arg(long, env = "PANEDRIVE_STATE")]
+    state: Option<PathBuf>,
+    /// Target for the attach backends: a tmux pane, or a zellij session.
+    #[arg(long)]
+    pane: Option<String>,
+    /// pty only: the program to spawn and its args, given after `--`.
+    #[arg(last = true)]
+    program: Vec<String>,
+    /// pty only: rows of the spawned pseudo-terminal.
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+    /// pty only: columns of the spawned pseudo-terminal.
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+    /// After each key/type step, wait up to ~1s for the seam to change
+    /// before the next step, so an `assert` does not race a stale snapshot.
+    #[arg(long)]
+    settle: bool,
+    /// Evaluate conditions against the captured screen text (`screen`,
+    /// `lines.<n>`) instead of a JSON state file, for apps with no seam.
+    #[arg(long)]
+    from_capture: bool,
+    /// Emit a JSON run summary on stdout: `{ok, failed_step?, steps:[..]}`.
+    #[arg(long)]
+    json: bool,
+    /// Write a JSONL event track (one line per step, timestamped) to this
+    /// path, for aligning a `--cast` recording or feeding CI/an agent.
+    #[arg(long)]
+    events: Option<PathBuf>,
+    /// Record an asciinema v2 cast to this path. Supported on the pty and
+    /// tmux backends (which expose a byte stream); not screen or zellij.
+    #[arg(long)]
+    cast: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -242,13 +246,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             keys,
             pane,
             backend,
-        } => {
-            // Join so a quoted spec ("2 Down Enter") and separate args
-            // (2 Down Enter) both parse identically.
-            let keys = key::parse_keys(&keys.join(" "))?;
-            backend_for(backend, pane)?.send_keys(&keys)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        } => cmd_press(keys, pane, backend),
         Cmd::Type {
             text,
             stdin,
@@ -256,287 +254,25 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             pane,
             backend,
             paste,
-        } => {
-            let text = resolve_type_text(text, stdin, from_env)?;
-            let backend = backend_for(backend, pane)?;
-            if paste {
-                backend.paste_text(&text)?;
-            } else {
-                let keys: Vec<Key> = text.chars().map(Key::Char).collect();
-                backend.send_keys(&keys)?;
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Cmd::Capture { pane, backend } => {
-            print!("{}", backend_for(backend, pane)?.capture()?);
-            Ok(ExitCode::SUCCESS)
-        }
+        } => cmd_type(text, stdin, from_env, pane, backend, paste),
+        Cmd::Capture { pane, backend } => cmd_capture(pane, backend),
         Cmd::WaitUntil {
             cond,
             state,
             timeout_ms,
             interval_ms,
             json,
-        } => {
-            let cond = Condition::parse(&cond)?;
-            let outcome = driver::wait_until(
-                &cond,
-                Duration::from_millis(timeout_ms),
-                Duration::from_millis(interval_ms),
-                || driver::read_state_file(&state),
-            );
-            match outcome {
-                WaitOutcome::Satisfied(took) => {
-                    let took = took.as_millis() as u64;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": true, "cond": cond.to_spec(), "waited_ms": took,
-                            })
-                        );
-                    } else {
-                        eprintln!("held after {took} ms");
-                    }
-                    Ok(ExitCode::SUCCESS)
-                }
-                WaitOutcome::TimedOut => {
-                    // Read once more so the message/JSON can report what the seam
-                    // last held, not just that it timed out.
-                    let observed = driver::read_state_file(&state)
-                        .map(|v| cond.observed(&v))
-                        .unwrap_or(Observed::Missing);
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": false, "cond": cond.to_spec(), "path": cond.path(),
-                                "timeout_ms": timeout_ms, "actual": observed_json(&observed),
-                            })
-                        );
-                    } else {
-                        eprintln!(
-                            "timed out after {timeout_ms} ms ({})",
-                            observed.describe(cond.path())
-                        );
-                    }
-                    Ok(ExitCode::from(1))
-                }
-            }
-        }
-        Cmd::State { state, paths } => {
-            let value = driver::read_state_file(&state)
-                .ok_or_else(|| anyhow::anyhow!("no readable JSON state at {}", state.display()))?;
-            if paths {
-                let leaves = seam::leaves(&value);
-                if leaves.is_empty() {
-                    eprintln!("(no assertable paths)");
-                }
-                let width = leaves.iter().map(|l| l.path.len()).max().unwrap_or(0);
-                for l in &leaves {
-                    println!("{:<width$} = {}  ({})", l.path, l.value, l.kind);
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Cmd::ValidateSeam { file, json } => {
-            let bytes = std::fs::read(&file)
-                .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
-            let report = match serde_json::from_slice::<Value>(&bytes) {
-                Ok(value) => seam::validate(&value),
-                Err(e) => seam::SeamReport {
-                    ok: false,
-                    problems: vec![format!("invalid JSON: {e}")],
-                    paths: 0,
-                },
-            };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": report.ok, "paths": report.paths,
-                        "problems": report.problems,
-                    })
-                );
-            } else if report.ok {
-                println!("seam ok: {} assertable path(s)", report.paths);
-            } else {
-                for p in &report.problems {
-                    eprintln!("seam problem: {p}");
-                }
-            }
-            Ok(if report.ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            })
-        }
-        Cmd::Assert { cond, state, json } => {
-            let cond = Condition::parse(&cond)?;
-            match driver::read_state_file(&state) {
-                Some(value) => {
-                    let ok = cond.eval(&value);
-                    if json {
-                        let actual = observed_json(&cond.observed(&value));
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": ok, "cond": cond.to_spec(),
-                                "path": cond.path(), "actual": actual,
-                            })
-                        );
-                    } else if !ok {
-                        eprintln!("assert failed: {}", cond.explain(&value));
-                    }
-                    Ok(if ok {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::from(1)
-                    })
-                }
-                None => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": false, "cond": cond.to_spec(),
-                                "error": "no readable state",
-                            })
-                        );
-                    } else {
-                        eprintln!("no readable state at {}", state.display());
-                    }
-                    Ok(ExitCode::from(1))
-                }
-            }
-        }
+        } => cmd_wait_until(cond, state, timeout_ms, interval_ms, json),
+        Cmd::State { state, paths } => cmd_state(state, paths),
+        Cmd::ValidateSeam { file, json } => cmd_validate_seam(file, json),
+        Cmd::Assert { cond, state, json } => cmd_assert(cond, state, json),
         Cmd::Watch {
             state,
             for_ms,
             interval_ms,
             distinct,
-        } => {
-            let n = driver::watch(
-                Duration::from_millis(for_ms),
-                Duration::from_millis(interval_ms),
-                distinct,
-                || driver::read_state_file(&state),
-                |t, v| {
-                    let line = serde_json::json!({ "t_ms": t.as_millis() as u64, "state": v });
-                    println!("{line}");
-                },
-            );
-            eprintln!("recorded {n} sample(s)");
-            Ok(ExitCode::SUCCESS)
-        }
-        Cmd::Run {
-            script,
-            backend,
-            state,
-            pane,
-            program,
-            rows,
-            cols,
-            settle,
-            from_capture,
-            json,
-            events,
-            cast,
-        } => {
-            if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
-                anyhow::bail!("--cast is supported on the pty and tmux backends only");
-            }
-            let text = std::fs::read_to_string(&script)
-                .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
-            let steps = parse_script(&text)?;
-            // The pty backend records via an output tap; tmux records via a
-            // pipe-pane recorder started below. Route the cast path accordingly.
-            let pty_cast = matches!(backend, Backend::Pty)
-                .then(|| cast.clone())
-                .flatten();
-            let pane_for_cast = pane.clone();
-            let backend_kind = backend;
-            let backend = run_backend(backend, pane, program, rows, cols, pty_cast)?;
-            // Start the tmux cast recorder (only for tmux + --cast).
-            let mut tmux_recorder = match (backend_kind, &cast) {
-                (Backend::Tmux, Some(path)) => {
-                    let pane = pane_for_cast.ok_or_else(|| {
-                        anyhow::anyhow!("--pane is required to record a tmux cast")
-                    })?;
-                    let file = std::fs::File::create(path).map_err(|e| {
-                        anyhow::anyhow!("creating cast file {}: {e}", path.display())
-                    })?;
-                    Some(panedrive::TmuxCastRecorder::start(pane, file)?)
-                }
-                _ => None,
-            };
-            let b: &dyn PaneBackend = backend.as_ref();
-            let opts = RunOptions {
-                settle: settle.then(|| Duration::from_millis(1000)),
-            };
-            // Read state from the JSON seam, or, with --from-capture, from the
-            // pane's visible text wrapped as {screen, lines} for uninstrumented
-            // apps.
-            let mut probe: Box<dyn FnMut() -> Option<serde_json::Value>> = if from_capture {
-                Box::new(move || b.capture().ok().map(|text| driver::screen_state(&text)))
-            } else {
-                Box::new(move || state.as_deref().and_then(driver::read_state_file))
-            };
-            let mut events_file =
-                match &events {
-                    Some(p) => Some(std::fs::File::create(p).map_err(|e| {
-                        anyhow::anyhow!("creating events file {}: {e}", p.display())
-                    })?),
-                    None => None,
-                };
-            let mut collected: Vec<RunEvent> = Vec::new();
-            // Scope the sink so its borrow of `collected`/`events_file` ends
-            // before we read `collected` for the summary below.
-            let outcome = {
-                let mut sink = ClosureSink::new(
-                    &mut probe,
-                    |screen: &str| print!("{screen}"),
-                    |e: &RunEvent| {
-                        if let Some(f) = events_file.as_mut() {
-                            let _ = writeln!(f, "{}", e.to_json());
-                        }
-                        if json {
-                            collected.push(e.clone());
-                        }
-                    },
-                );
-                run_script(&steps, b, &opts, &mut sink)?
-            };
-            // Flush and finalize the tmux cast (drops the pipe, joins the tail).
-            if let Some(r) = tmux_recorder.as_mut() {
-                r.stop();
-            }
-            let steps_json: Vec<Value> = collected.iter().map(RunEvent::to_json).collect();
-            match outcome {
-                RunResult::Passed => {
-                    if json {
-                        println!("{}", serde_json::json!({ "ok": true, "steps": steps_json }));
-                    }
-                    Ok(ExitCode::SUCCESS)
-                }
-                RunResult::Failed(failure) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": false, "failed_step": failure.step,
-                                "failure": failure.to_json(), "steps": steps_json,
-                            })
-                        );
-                    } else {
-                        eprintln!("{}", failure.human());
-                    }
-                    Ok(ExitCode::from(1))
-                }
-            }
-        }
+        } => cmd_watch(state, for_ms, interval_ms, distinct),
+        Cmd::Run(args) => cmd_run(args),
         Cmd::Record {
             script,
             cast,
@@ -545,6 +281,324 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             program,
         } => spawn_record(script, cast, rows, cols, program),
     }
+}
+
+/// `press`: send a key spec to a pane.
+fn cmd_press(keys: Vec<String>, pane: String, backend: Backend) -> anyhow::Result<ExitCode> {
+    // Join so a quoted spec ("2 Down Enter") and separate args
+    // (2 Down Enter) both parse identically.
+    let keys = key::parse_keys(&keys.join(" "))?;
+    backend_for(backend, pane)?.send_keys(&keys)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `type`: type literal or secret text into a pane.
+fn cmd_type(
+    text: Option<String>,
+    stdin: bool,
+    from_env: Option<String>,
+    pane: String,
+    backend: Backend,
+    paste: bool,
+) -> anyhow::Result<ExitCode> {
+    let text = resolve_type_text(text, stdin, from_env)?;
+    let backend = backend_for(backend, pane)?;
+    if paste {
+        backend.paste_text(&text)?;
+    } else {
+        let keys: Vec<Key> = text.chars().map(Key::Char).collect();
+        backend.send_keys(&keys)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `capture`: print a pane's visible text.
+fn cmd_capture(pane: String, backend: Backend) -> anyhow::Result<ExitCode> {
+    print!("{}", backend_for(backend, pane)?.capture()?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `wait-until`: poll the seam until the condition holds or time out.
+fn cmd_wait_until(
+    cond: String,
+    state: PathBuf,
+    timeout_ms: u64,
+    interval_ms: u64,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let cond = Condition::parse(&cond)?;
+    let outcome = driver::wait_until(
+        &cond,
+        Duration::from_millis(timeout_ms),
+        Duration::from_millis(interval_ms),
+        || driver::read_state_file(&state),
+    );
+    match outcome {
+        WaitOutcome::Satisfied(took) => {
+            let took = took.as_millis() as u64;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true, "cond": cond.to_spec(), "waited_ms": took,
+                    })
+                );
+            } else {
+                eprintln!("held after {took} ms");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        WaitOutcome::TimedOut => {
+            // Read once more so the message/JSON can report what the seam last
+            // held, not just that it timed out.
+            let observed = driver::read_state_file(&state)
+                .map(|v| cond.observed(&v))
+                .unwrap_or(Observed::Missing);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false, "cond": cond.to_spec(), "path": cond.path(),
+                        "timeout_ms": timeout_ms, "actual": observed.to_json(),
+                    })
+                );
+            } else {
+                eprintln!(
+                    "timed out after {timeout_ms} ms ({})",
+                    observed.describe(cond.path())
+                );
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// `state`: pretty-print the seam, or list its assertable dot-paths.
+fn cmd_state(state: PathBuf, paths: bool) -> anyhow::Result<ExitCode> {
+    let value = driver::read_state_file(&state)
+        .ok_or_else(|| anyhow::anyhow!("no readable JSON state at {}", state.display()))?;
+    if paths {
+        let leaves = seam::leaves(&value);
+        if leaves.is_empty() {
+            eprintln!("(no assertable paths)");
+        }
+        let width = leaves.iter().map(|l| l.path.len()).max().unwrap_or(0);
+        for l in &leaves {
+            println!("{:<width$} = {}  ({})", l.path, l.value, l.kind);
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `validate-seam`: check a JSON file against the seam contract.
+fn cmd_validate_seam(file: PathBuf, json: bool) -> anyhow::Result<ExitCode> {
+    let bytes =
+        std::fs::read(&file).map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+    let report = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => seam::validate(&value),
+        Err(e) => seam::SeamReport {
+            ok: false,
+            problems: vec![format!("invalid JSON: {e}")],
+            paths: 0,
+        },
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": report.ok, "paths": report.paths,
+                "problems": report.problems,
+            })
+        );
+    } else if report.ok {
+        println!("seam ok: {} assertable path(s)", report.paths);
+    } else {
+        for p in &report.problems {
+            eprintln!("seam problem: {p}");
+        }
+    }
+    Ok(if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// `assert`: evaluate a condition against the seam once.
+fn cmd_assert(cond: String, state: PathBuf, json: bool) -> anyhow::Result<ExitCode> {
+    let cond = Condition::parse(&cond)?;
+    match driver::read_state_file(&state) {
+        Some(value) => {
+            let ok = cond.eval(&value);
+            if json {
+                let actual = cond.observed(&value).to_json();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": ok, "cond": cond.to_spec(),
+                        "path": cond.path(), "actual": actual,
+                    })
+                );
+            } else if !ok {
+                eprintln!("assert failed: {}", cond.explain(&value));
+            }
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false, "cond": cond.to_spec(),
+                        "error": "no readable state",
+                    })
+                );
+            } else {
+                eprintln!("no readable state at {}", state.display());
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// `watch`: record the seam over a window as JSONL transitions.
+fn cmd_watch(
+    state: PathBuf,
+    for_ms: u64,
+    interval_ms: u64,
+    distinct: bool,
+) -> anyhow::Result<ExitCode> {
+    let n = driver::watch(
+        Duration::from_millis(for_ms),
+        Duration::from_millis(interval_ms),
+        distinct,
+        || driver::read_state_file(&state),
+        |t, v| {
+            let line = serde_json::json!({ "t_ms": t.as_millis() as u64, "state": v });
+            println!("{line}");
+        },
+    );
+    eprintln!("recorded {n} sample(s)");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `run`: execute a script of steps against one backend in one process.
+fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    let RunArgs {
+        script,
+        backend,
+        state,
+        pane,
+        program,
+        rows,
+        cols,
+        settle,
+        from_capture,
+        json,
+        events,
+        cast,
+    } = args;
+    if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
+        anyhow::bail!("--cast is supported on the pty and tmux backends only");
+    }
+    let text = std::fs::read_to_string(&script)
+        .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
+    let steps = parse_script(&text)?;
+    // The pty backend records the cast via an output tap; tmux records via a
+    // pipe-pane recorder. Route the one cast path to whichever the backend can
+    // stream from.
+    let pty_cast = matches!(backend, Backend::Pty)
+        .then(|| cast.clone())
+        .flatten();
+    let tmux_cast = matches!(backend, Backend::Tmux)
+        .then(|| cast.clone())
+        .flatten();
+    let backend_box = run_backend(backend, pane.clone(), program, rows, cols, pty_cast)?;
+    let mut tmux_recorder = start_tmux_cast(pane, tmux_cast)?;
+    let b: &dyn PaneBackend = backend_box.as_ref();
+    let opts = RunOptions {
+        settle: settle.then(|| Duration::from_millis(1000)),
+    };
+    // Read state from the JSON seam, or, with --from-capture, from the pane's
+    // visible text wrapped as {screen, lines} for uninstrumented apps.
+    let mut probe: Box<dyn FnMut() -> Option<serde_json::Value>> = if from_capture {
+        Box::new(move || b.capture().ok().map(|text| driver::screen_state(&text)))
+    } else {
+        Box::new(move || state.as_deref().and_then(driver::read_state_file))
+    };
+    let mut events_file = match &events {
+        Some(p) => Some(
+            std::fs::File::create(p)
+                .map_err(|e| anyhow::anyhow!("creating events file {}: {e}", p.display()))?,
+        ),
+        None => None,
+    };
+    let mut collected: Vec<RunEvent> = Vec::new();
+    // Scope the sink so its borrow of `collected`/`events_file` ends before we
+    // read `collected` for the summary below.
+    let outcome = {
+        let mut sink = ClosureSink::new(
+            &mut probe,
+            |screen: &str| print!("{screen}"),
+            |e: &RunEvent| {
+                if let Some(f) = events_file.as_mut() {
+                    let _ = writeln!(f, "{}", e.to_json());
+                }
+                if json {
+                    collected.push(e.clone());
+                }
+            },
+        );
+        run_script(&steps, b, &opts, &mut sink)?
+    };
+    // Flush and finalize the tmux cast (drops the pipe, joins the tail).
+    if let Some(r) = tmux_recorder.as_mut() {
+        r.stop();
+    }
+    let steps_json: Vec<Value> = collected.iter().map(RunEvent::to_json).collect();
+    match outcome {
+        RunResult::Passed => {
+            if json {
+                println!("{}", serde_json::json!({ "ok": true, "steps": steps_json }));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        RunResult::Failed(failure) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false, "failed_step": failure.step,
+                        "failure": failure.to_json(), "steps": steps_json,
+                    })
+                );
+            } else {
+                eprintln!("{}", failure.human());
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// Start a tmux `--cast` recorder when a cast path is set. Encapsulates the
+/// `--pane` requirement and file creation so `cmd_run` never branches on the
+/// recorder's internals. `cast` is already gated to the tmux backend by the
+/// caller, so `None` simply means "no tmux cast to record".
+fn start_tmux_cast(
+    pane: Option<String>,
+    cast: Option<PathBuf>,
+) -> anyhow::Result<Option<panedrive::TmuxCastRecorder>> {
+    let Some(path) = cast else { return Ok(None) };
+    let pane = pane.ok_or_else(|| anyhow::anyhow!("--pane is required to record a tmux cast"))?;
+    let file = std::fs::File::create(&path)
+        .map_err(|e| anyhow::anyhow!("creating cast file {}: {e}", path.display()))?;
+    Ok(Some(panedrive::TmuxCastRecorder::start(pane, file)?))
 }
 
 /// Record an interactive PTY session into a `.pds` script (and optionally a
@@ -654,15 +708,6 @@ fn spawn_record(
     _program: Vec<String>,
 ) -> anyhow::Result<ExitCode> {
     anyhow::bail!("record spawns a program in a PTY, so it requires building with `--features pty`")
-}
-
-/// Render an observed path value as JSON for `--json` output: the scalar text,
-/// or `null` when the path was absent or non-scalar.
-fn observed_json(observed: &Observed) -> Value {
-    match observed.scalar() {
-        Some(s) => Value::String(s.to_string()),
-        None => Value::Null,
-    }
 }
 
 /// Resolve the text for `type` from exactly one source: a literal argument,

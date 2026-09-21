@@ -69,6 +69,15 @@ impl Observed {
             _ => None,
         }
     }
+
+    /// Render as JSON for `--json` output: the scalar text as a string, or
+    /// `null` when the path was absent or resolved to a non-scalar.
+    pub fn to_json(&self) -> Value {
+        match self.scalar() {
+            Some(s) => Value::String(s.to_string()),
+            None => Value::Null,
+        }
+    }
 }
 
 /// A parsed condition over the state JSON.

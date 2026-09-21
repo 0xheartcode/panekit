@@ -144,14 +144,14 @@ impl StepFailure {
                 m.insert("error".into(), "no readable state".into());
             }
             FailReason::Unmet { observed } => {
-                m.insert("actual".into(), scalar_json(observed));
+                m.insert("actual".into(), observed.to_json());
             }
             FailReason::TimedOut {
                 timeout_ms,
                 observed,
             } => {
                 m.insert("timeout_ms".into(), (*timeout_ms).into());
-                m.insert("actual".into(), scalar_json(observed));
+                m.insert("actual".into(), observed.to_json());
             }
         }
         Value::Object(m)
@@ -192,15 +192,6 @@ impl RunEvent {
             m.insert("actual".into(), a.clone().into());
         }
         Value::Object(m)
-    }
-}
-
-/// Render an `Observed` scalar as JSON, or `null` when the path was absent or
-/// non-scalar.
-fn scalar_json(observed: &Observed) -> Value {
-    match observed.scalar() {
-        Some(s) => Value::String(s.to_string()),
-        None => Value::Null,
     }
 }
 
