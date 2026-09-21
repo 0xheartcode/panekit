@@ -176,6 +176,24 @@ mod tests {
     }
 
     #[test]
+    fn tmux_encoding_maps_every_variant() {
+        // Every Key variant maps to its exact TmuxKey. Literal for a printable
+        // char; a Named token for each control/navigation key.
+        assert_eq!(Key::Char('z').to_tmux(), TmuxKey::Literal('z'));
+        assert_eq!(Key::Char('é').to_tmux(), TmuxKey::Literal('é'));
+        assert_eq!(Key::Enter.to_tmux(), TmuxKey::Named("Enter".into()));
+        assert_eq!(Key::Tab.to_tmux(), TmuxKey::Named("Tab".into()));
+        assert_eq!(Key::Backspace.to_tmux(), TmuxKey::Named("BSpace".into()));
+        assert_eq!(Key::Esc.to_tmux(), TmuxKey::Named("Escape".into()));
+        assert_eq!(Key::Up.to_tmux(), TmuxKey::Named("Up".into()));
+        assert_eq!(Key::Down.to_tmux(), TmuxKey::Named("Down".into()));
+        assert_eq!(Key::Left.to_tmux(), TmuxKey::Named("Left".into()));
+        assert_eq!(Key::Right.to_tmux(), TmuxKey::Named("Right".into()));
+        assert_eq!(Key::Ctrl('c').to_tmux(), TmuxKey::Named("C-c".into()));
+        assert_eq!(Key::Ctrl('x').to_tmux(), TmuxKey::Named("C-x".into()));
+    }
+
+    #[test]
     fn zellij_encoding_splits_chars_from_raw_bytes() {
         assert_eq!(Key::Char('a').to_zellij(), ZellijKey::Chars('a'));
         assert_eq!(Key::Char('é').to_zellij(), ZellijKey::Chars('é'));

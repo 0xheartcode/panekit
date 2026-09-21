@@ -845,6 +845,60 @@ fn spawn_pty(
     anyhow::bail!("the pty backend requires building panedrive with `--features pty`")
 }
 
+#[cfg(test)]
+mod resolve_tests {
+    use super::{Backend, resolve_type_text, run_backend};
+
+    #[test]
+    fn resolve_type_text_errors_with_no_source() {
+        assert!(resolve_type_text(None, false, None).is_err());
+    }
+
+    #[test]
+    fn resolve_type_text_errors_with_two_sources() {
+        // A literal plus --stdin is ambiguous: exactly one source is required.
+        assert!(resolve_type_text(Some("x".into()), true, None).is_err());
+    }
+
+    #[test]
+    fn resolve_type_text_errors_with_literal_and_env() {
+        assert!(resolve_type_text(Some("x".into()), false, Some("V".into())).is_err());
+    }
+
+    #[test]
+    fn resolve_type_text_reads_a_set_env_var() {
+        let var = "PANEDRIVE_RESOLVE_TEST_SET";
+        // SAFETY: single-threaded test scope, unique var name, cleaned up.
+        unsafe {
+            std::env::set_var(var, "from-the-env");
+        }
+        let got = resolve_type_text(None, false, Some(var.into()));
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_eq!(got.unwrap(), "from-the-env");
+    }
+
+    #[test]
+    fn resolve_type_text_errors_on_unset_env_var() {
+        let var = "PANEDRIVE_RESOLVE_TEST_UNSET";
+        // SAFETY: single-threaded test scope, unique var name.
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert!(resolve_type_text(None, false, Some(var.into())).is_err());
+    }
+
+    #[test]
+    fn run_backend_requires_a_pane_for_attach_backends() {
+        // Each attach backend errors on a missing --pane without spawning
+        // anything. The pty arm is feature-gated and not exercised here.
+        assert!(run_backend(Backend::Tmux, None, vec![], 24, 80, None).is_err());
+        assert!(run_backend(Backend::Zellij, None, vec![], 24, 80, None).is_err());
+        assert!(run_backend(Backend::Screen, None, vec![], 24, 80, None).is_err());
+    }
+}
+
 #[cfg(all(test, feature = "pty"))]
 mod pty_program_tests {
     use super::resolve_pty_program;

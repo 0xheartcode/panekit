@@ -141,6 +141,17 @@ mod tests {
     }
 
     #[test]
+    fn escape_sequence_split_across_two_feeds_decodes_as_one_key() {
+        // The ESC byte arrives alone (held back as an incomplete sequence),
+        // then the rest of the CSI (`[A`) arrives on the next feed. The finished
+        // script must decode the whole thing as a single `press Up`.
+        let mut r = ScriptRecorder::new();
+        r.feed(b"\x1b");
+        r.feed(b"[A");
+        assert_eq!(r.finish(), "press Up\n");
+    }
+
+    #[test]
     fn ctrl_letters_and_named_keys() {
         let mut r = ScriptRecorder::new();
         r.feed(b"a"); // literal

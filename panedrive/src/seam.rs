@@ -138,10 +138,41 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_object_roots_and_empty_objects() {
-        assert!(!validate(&json!([1, 2, 3])).ok);
-        assert!(!validate(&json!("scalar")).ok);
+        // An array root and a scalar root are both rejected, but with *distinct*
+        // messages, so the array arm cannot be deleted without a test noticing.
+        let array = validate(&json!([1, 2, 3]));
+        assert!(!array.ok);
+        assert!(
+            array.problems[0].contains("array"),
+            "array root problem should name the array shape, got {:?}",
+            array.problems[0]
+        );
+        assert!(
+            !array.problems[0].contains("scalar"),
+            "array root must not be reported as a scalar, got {:?}",
+            array.problems[0]
+        );
+
+        let scalar = validate(&json!("scalar"));
+        assert!(!scalar.ok);
+        assert!(
+            scalar.problems[0].contains("scalar"),
+            "scalar root problem should name the scalar shape, got {:?}",
+            scalar.problems[0]
+        );
+        assert!(
+            !scalar.problems[0].contains("array"),
+            "scalar root must not be reported as an array, got {:?}",
+            scalar.problems[0]
+        );
+
         let empty = validate(&json!({}));
         assert!(!empty.ok);
+        assert!(
+            empty.problems[0].contains("empty"),
+            "empty-object problem should say it is empty, got {:?}",
+            empty.problems[0]
+        );
         assert_eq!(empty.paths, 0);
     }
 }

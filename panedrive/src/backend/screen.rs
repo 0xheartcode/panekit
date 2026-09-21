@@ -130,6 +130,28 @@ mod tests {
     }
 
     #[test]
+    fn read_when_ready_retries_until_the_file_appears() {
+        // A path that does not exist yet: read_when_ready must retry over its
+        // NotFound branch rather than failing, then return the contents once a
+        // writer lands the file. The writer sleeps well under the ~500ms budget.
+        let path = std::env::temp_dir().join(format!(
+            "panedrive-read-when-ready-{}-{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&path).ok();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            std::fs::write(&writer_path, b"landed").unwrap();
+        });
+        let contents = read_when_ready(&path);
+        writer.join().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(contents.unwrap(), "landed");
+    }
+
+    #[test]
     fn dump_path_is_session_scoped_sanitized_and_in_temp() {
         let p = ScreenBackend::new("a/b").dump_path();
         assert_eq!(p.parent().unwrap(), std::env::temp_dir());
