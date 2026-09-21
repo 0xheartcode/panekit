@@ -12,10 +12,12 @@
 # Rule: never lower a threshold to make a check pass. Fix the code, or change the
 # threshold ON PURPOSE in a commit that says why. COV_FLOOR is a ratchet.
 
-# Workspace line-coverage floor. Baseline 2026-08-26 = 90.11% (tmux backend and
-# CLI proven by integration tests; only the press/capture CLI arms sit above the
-# floor). Ratchet UP as slices land; never down to pass.
-COV_FLOOR ?= 85
+# Workspace line-coverage floor, measured with --all-features so the pty
+# backend and the `record` loop are IN the number, not silently excluded.
+# Ratcheted 2026-09-21: 85 -> 90 (actual 91.2%, pty paths now proven by
+# tests/record_pty.rs and the pty roundtrips). Ratchet UP as slices land;
+# never down to pass.
+COV_FLOOR ?= 90
 
 .PHONY: check fmt lint deps test test-pty cov-gate cov cov-html audit package
 
@@ -45,15 +47,18 @@ test:
 	@echo "── tests ──"
 	cargo test --workspace --quiet
 
+# --all-features so the pty backend and the `record` loop are measured, not
+# invisibly excluded (they were, before 2026-09-21). The pty roundtrips and
+# tests/record_pty.rs run under instrumentation and cover those paths.
 cov-gate:
-	@echo "── coverage floor ($(COV_FLOOR)% lines) ──"
-	cargo llvm-cov --workspace --summary-only --fail-under-lines $(COV_FLOOR)
+	@echo "── coverage floor ($(COV_FLOOR)% lines, --all-features) ──"
+	cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines $(COV_FLOOR)
 
 cov:
-	cargo llvm-cov --workspace --summary-only
+	cargo llvm-cov --workspace --all-features --summary-only
 
 cov-html:
-	cargo llvm-cov --workspace --html
+	cargo llvm-cov --workspace --all-features --html
 	@echo "open target/llvm-cov/html/index.html"
 
 # Supply-chain gate (advisories/bans/licenses/sources), config in deny.toml.
