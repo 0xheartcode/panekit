@@ -8,7 +8,7 @@ Entries are kept on a single line each: cargo-dist injects this file into the Gi
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-08-31
+## [0.1.2] - 2026-09-21
 
 ### Added
 
