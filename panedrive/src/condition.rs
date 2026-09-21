@@ -21,10 +21,67 @@ use serde_json::Value;
 /// A numeric comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumOp {
+    /// Greater than (`>`).
     Gt,
+    /// Less than (`<`).
     Lt,
+    /// Greater than or equal (`>=`).
     Ge,
+    /// Less than or equal (`<=`).
     Le,
+}
+
+impl NumOp {
+    /// The operator's source symbol, for reconstructing a condition spec.
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            NumOp::Gt => ">",
+            NumOp::Lt => "<",
+            NumOp::Ge => ">=",
+            NumOp::Le => "<=",
+        }
+    }
+}
+
+/// What a condition's dot-path resolved to, used to explain a result without
+/// re-reading the state seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    /// A scalar leaf, rendered as its textual form.
+    Scalar(String),
+    /// The path resolved to an object or array (not comparable to a bare value).
+    NonScalar,
+    /// The path did not resolve.
+    Missing,
+}
+
+impl Observed {
+    /// A human phrase describing what was seen at the path, e.g. `was 1`,
+    /// `not present`, `is not a scalar`.
+    pub fn describe(&self, path: &str) -> String {
+        match self {
+            Observed::Scalar(s) => format!("{path} was {s}"),
+            Observed::NonScalar => format!("{path} is not a scalar"),
+            Observed::Missing => format!("{path} not present"),
+        }
+    }
+
+    /// The scalar text if the path held one, else `None` (missing/non-scalar).
+    pub fn scalar(&self) -> Option<&str> {
+        match self {
+            Observed::Scalar(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Render as JSON for `--json` output: the scalar text as a string, or
+    /// `null` when the path was absent or resolved to a non-scalar.
+    pub fn to_json(&self) -> Value {
+        match self.scalar() {
+            Some(s) => Value::String(s.to_string()),
+            None => Value::Null,
+        }
+    }
 }
 
 /// A parsed condition over the state JSON.
@@ -91,6 +148,51 @@ impl Condition {
             anyhow::bail!("empty condition");
         }
         Ok(Condition::Exists(path))
+    }
+
+    /// The dot-path this condition addresses.
+    pub fn path(&self) -> &str {
+        match self {
+            Condition::Exists(p)
+            | Condition::Equals(p, _)
+            | Condition::NotEquals(p, _)
+            | Condition::Contains(p, _)
+            | Condition::Compare(p, _, _) => p,
+        }
+    }
+
+    /// Reconstruct the canonical spec (`bag.count>=2`), for messages that should
+    /// echo the user's condition rather than the internal `Debug` form.
+    pub fn to_spec(&self) -> String {
+        match self {
+            Condition::Exists(p) => p.clone(),
+            Condition::Equals(p, w) => format!("{p}={w}"),
+            Condition::NotEquals(p, w) => format!("{p}!={w}"),
+            Condition::Contains(p, w) => format!("{p}~={w}"),
+            Condition::Compare(p, op, w) => format!("{p}{}{w}", op.symbol()),
+        }
+    }
+
+    /// What the condition's path resolved to in `root`.
+    pub fn observed(&self, root: &Value) -> Observed {
+        match value_at(root, self.path()) {
+            None => Observed::Missing,
+            Some(Value::Object(_) | Value::Array(_)) => Observed::NonScalar,
+            Some(v) => match scalar_text(v) {
+                Some(s) => Observed::Scalar(s),
+                None => Observed::NonScalar,
+            },
+        }
+    }
+
+    /// A one-line failure explanation: the spec plus what was actually seen,
+    /// e.g. `bag.count=2 (bag.count was 1)`.
+    pub fn explain(&self, root: &Value) -> String {
+        format!(
+            "{} ({})",
+            self.to_spec(),
+            self.observed(root).describe(self.path())
+        )
     }
 
     /// Evaluate against a state value.
@@ -163,7 +265,12 @@ fn value_at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// The scalar text at a path, or `None` if missing or non-scalar.
 fn scalar_at(root: &Value, path: &str) -> Option<String> {
-    match value_at(root, path)? {
+    scalar_text(value_at(root, path)?)
+}
+
+/// The textual form of a scalar JSON value, or `None` for objects/arrays.
+fn scalar_text(v: &Value) -> Option<String> {
+    match v {
         Value::String(s) => Some(s.clone()),
         Value::Bool(b) => Some(b.to_string()),
         Value::Number(n) => Some(n.to_string()),
@@ -285,6 +392,41 @@ mod tests {
         // non-numeric scalar or absent path is unsatisfied, never a panic
         assert!(!Condition::parse("focus>1").unwrap().eval(&state()));
         assert!(!Condition::parse("missing>1").unwrap().eval(&state()));
+    }
+
+    #[test]
+    fn to_spec_reconstructs_the_canonical_form() {
+        for spec in [
+            "focus",
+            "focus=fleet",
+            "bag.count!=0",
+            "focus~=fle",
+            "bag.count>=2",
+            "bag.count<9",
+        ] {
+            assert_eq!(Condition::parse(spec).unwrap().to_spec(), spec);
+        }
+        // a trailing `?` and a leading `.` normalize away
+        assert_eq!(Condition::parse(".focus?").unwrap().to_spec(), "focus");
+    }
+
+    #[test]
+    fn observed_reports_scalar_missing_and_non_scalar() {
+        let c = Condition::parse("bag.count=9").unwrap();
+        assert_eq!(c.observed(&state()), Observed::Scalar("2".into()));
+        let c = Condition::parse("missing=1").unwrap();
+        assert_eq!(c.observed(&state()), Observed::Missing);
+        // an object path is non-scalar
+        let c = Condition::parse("bag=x").unwrap();
+        assert_eq!(c.observed(&state()), Observed::NonScalar);
+    }
+
+    #[test]
+    fn explain_echoes_spec_and_actual_value() {
+        let c = Condition::parse("bag.count=9").unwrap();
+        assert_eq!(c.explain(&state()), "bag.count=9 (bag.count was 2)");
+        let c = Condition::parse("missing=1").unwrap();
+        assert_eq!(c.explain(&state()), "missing=1 (missing not present)");
     }
 
     #[test]

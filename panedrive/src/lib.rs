@@ -11,17 +11,26 @@
 //! The split is deliberate: pairing tmux *input* with a JSON *state* seam gives
 //! you real-keybinding fidelity without the flakiness of screen-scraping. See
 //! `docs/ARCHITECTURE.md`.
+#![deny(missing_docs)]
 
 pub mod backend;
+pub mod cast;
 pub mod condition;
 pub mod driver;
 pub mod key;
+pub mod record;
 pub mod script;
+pub mod seam;
 
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;
 pub use backend::{PaneBackend, screen::ScreenBackend, tmux::TmuxBackend, zellij::ZellijBackend};
-pub use condition::{Condition, NumOp};
+pub use cast::{CastWriter, TmuxCastRecorder};
+pub use condition::{Condition, NumOp, Observed};
 pub use driver::{WaitOutcome, read_state_file, screen_state, wait_until, watch};
 pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
-pub use script::{RunResult, Step, TypeSource, parse_script, run_script, run_script_settling};
+pub use record::ScriptRecorder;
+pub use script::{
+    ClosureSink, FailReason, RunEvent, RunOptions, RunResult, RunSink, Step, StepFailure,
+    TypeSource, parse_script, probe_sink, run_script,
+};

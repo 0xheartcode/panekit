@@ -204,3 +204,198 @@ fn type_requires_exactly_one_text_source() {
         "unset env var should be a usage error"
     );
 }
+
+/// Run a command, returning its exit code and captured stdout.
+fn output(mut cmd: Command) -> (i32, String) {
+    let out = cmd.output().unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn assert_json_reports_the_observed_value() {
+    let state = write_state("assert-json", r#"{"count":1}"#);
+
+    let mut fail = bin();
+    fail.args(["assert", "count=2", "--state"])
+        .arg(&state)
+        .arg("--json");
+    let (c, out) = output(fail);
+    assert_eq!(c, 1);
+    assert!(out.contains(r#""ok":false"#), "stdout: {out}");
+    assert!(out.contains(r#""actual":"1""#), "stdout: {out}");
+
+    let mut pass = bin();
+    pass.args(["assert", "count=1", "--state"])
+        .arg(&state)
+        .arg("--json");
+    let (c2, out2) = output(pass);
+    assert_eq!(c2, 0);
+    assert!(out2.contains(r#""ok":true"#), "stdout: {out2}");
+
+    fs::remove_file(&state).ok();
+}
+
+#[test]
+fn assert_json_without_state_reports_an_error() {
+    let mut cmd = bin();
+    cmd.args(["assert", "x=1", "--state", "/no/such/state.json", "--json"]);
+    let (c, out) = output(cmd);
+    assert_eq!(c, 1);
+    assert!(
+        out.contains(r#""error":"no readable state""#),
+        "stdout: {out}"
+    );
+}
+
+#[test]
+fn wait_until_json_times_out_and_succeeds() {
+    let miss = write_state("wait-miss", r#"{"ready":false}"#);
+    let mut to = bin();
+    to.args(["wait-until", "ready=true", "--state"])
+        .arg(&miss)
+        .args(["--timeout-ms", "20", "--interval-ms", "5", "--json"]);
+    let (c, out) = output(to);
+    assert_eq!(c, 1);
+    assert!(
+        out.contains(r#""ok":false"#) && out.contains(r#""timeout_ms":20"#),
+        "stdout: {out}"
+    );
+
+    let hit = write_state("wait-hit", r#"{"ready":true}"#);
+    let mut ok = bin();
+    ok.args(["wait-until", "ready=true", "--state"])
+        .arg(&hit)
+        .arg("--json");
+    let (c2, out2) = output(ok);
+    assert_eq!(c2, 0);
+    assert!(out2.contains(r#""ok":true"#), "stdout: {out2}");
+
+    fs::remove_file(&miss).ok();
+    fs::remove_file(&hit).ok();
+}
+
+#[test]
+fn state_command_prints_paths_and_pretty_json() {
+    let state = write_state("state-cmd", r#"{"focus":"fleet","bag":{"count":2}}"#);
+
+    let mut paths = bin();
+    paths.args(["state", "--state"]).arg(&state).arg("--paths");
+    let (c, out) = output(paths);
+    assert_eq!(c, 0);
+    assert!(
+        out.contains("bag.count") && out.contains("focus"),
+        "stdout: {out}"
+    );
+
+    let mut pretty = bin();
+    pretty.args(["state", "--state"]).arg(&state);
+    let (c2, out2) = output(pretty);
+    assert_eq!(c2, 0);
+    assert!(out2.contains("\"focus\""), "stdout: {out2}");
+
+    fs::remove_file(&state).ok();
+}
+
+#[test]
+fn state_defaults_from_the_env_var() {
+    let state = write_state("state-env", r#"{"a":1}"#);
+    let mut cmd = bin();
+    cmd.args(["assert", "a=1", "--json"])
+        .env("PANEDRIVE_STATE", &state);
+    assert_eq!(code(cmd), 0, "assert should read $PANEDRIVE_STATE");
+    fs::remove_file(&state).ok();
+}
+
+#[test]
+fn validate_seam_accepts_objects_and_rejects_the_rest() {
+    let good = write_state("seam-ok", r#"{"focus":"fleet"}"#);
+    let mut c1 = bin();
+    c1.arg("validate-seam").arg(&good);
+    assert_eq!(code(c1), 0);
+
+    let bad = write_state("seam-bad", r#"[1,2,3]"#);
+    let mut c2 = bin();
+    c2.arg("validate-seam").arg(&bad).arg("--json");
+    let (code2, out) = output(c2);
+    assert_eq!(code2, 1);
+    assert!(out.contains(r#""ok":false"#), "stdout: {out}");
+
+    let junk = write_state("seam-junk", "not json at all");
+    let mut c3 = bin();
+    c3.arg("validate-seam").arg(&junk);
+    assert_eq!(code(c3), 1);
+
+    fs::remove_file(&good).ok();
+    fs::remove_file(&bad).ok();
+    fs::remove_file(&junk).ok();
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn run_over_tmux_emits_json_events_and_a_cast() {
+    if !tmux_available() {
+        eprintln!("skipping run_over_tmux_emits_json_events_and_a_cast: tmux not installed");
+        return;
+    }
+    let sess = format!("pd-cli-cast-{}", std::process::id());
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &sess])
+        .status();
+    let started = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &sess,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "cat",
+        ])
+        .status()
+        .unwrap();
+    assert!(started.success(), "could not start tmux session");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let script = write_script("tmux-cast", "type hello\npress Enter\nsleep 200ms\n");
+    let events = std::env::temp_dir().join(format!("pd-events-{}.jsonl", std::process::id()));
+    let cast = std::env::temp_dir().join(format!("pd-cast-{}.cast", std::process::id()));
+
+    let mut cmd = bin();
+    cmd.arg("run")
+        .arg(&script)
+        .args(["--backend", "tmux", "--pane", &sess, "--json", "--events"])
+        .arg(&events)
+        .arg("--cast")
+        .arg(&cast);
+    let (c, out) = output(cmd);
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &sess])
+        .status();
+
+    assert_eq!(c, 0, "run should pass; stdout: {out}");
+    assert!(out.contains(r#""ok":true"#), "stdout: {out}");
+    let ev = fs::read_to_string(&events).unwrap();
+    assert!(ev.lines().count() >= 3, "expected >=3 events, got: {ev}");
+    let cast_txt = fs::read_to_string(&cast).unwrap();
+    assert!(
+        cast_txt.lines().next().unwrap().contains(r#""version":2"#),
+        "cast header: {:?}",
+        cast_txt.lines().next()
+    );
+
+    fs::remove_file(&script).ok();
+    fs::remove_file(&events).ok();
+    fs::remove_file(&cast).ok();
+}

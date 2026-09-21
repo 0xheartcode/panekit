@@ -31,6 +31,7 @@
 //! let app = App { focus: "fleet", rows: 3 };
 //! assert_eq!(app.dump_state(), json!({ "focus": "fleet", "rows": 3 }));
 //! ```
+#![deny(missing_docs)]
 
 use serde::Serialize;
 use serde_json::Value;

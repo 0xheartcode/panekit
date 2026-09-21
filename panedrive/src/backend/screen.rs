@@ -21,6 +21,7 @@ pub struct ScreenBackend {
 }
 
 impl ScreenBackend {
+    /// Drive the screen session with the given session name.
     pub fn new(session: impl Into<String>) -> Self {
         Self {
             session: session.into(),
@@ -127,6 +128,28 @@ mod tests {
         // Ctrl-c is a lone 0x03.
         assert_eq!(stuff_payload(&parse_keys("C-c").unwrap()), "\u{3}");
         assert_eq!(stuff_payload(&[]), "");
+    }
+
+    #[test]
+    fn read_when_ready_retries_until_the_file_appears() {
+        // A path that does not exist yet: read_when_ready must retry over its
+        // NotFound branch rather than failing, then return the contents once a
+        // writer lands the file. The writer sleeps well under the ~500ms budget.
+        let path = std::env::temp_dir().join(format!(
+            "panedrive-read-when-ready-{}-{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&path).ok();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            std::fs::write(&writer_path, b"landed").unwrap();
+        });
+        let contents = read_when_ready(&path);
+        writer.join().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(contents.unwrap(), "landed");
     }
 
     #[test]

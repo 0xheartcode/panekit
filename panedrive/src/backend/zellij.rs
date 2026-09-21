@@ -30,6 +30,7 @@ struct Action {
 }
 
 impl ZellijBackend {
+    /// Drive the zellij session with the given session name.
     pub fn new(session: impl Into<String>) -> Self {
         Self {
             session: session.into(),

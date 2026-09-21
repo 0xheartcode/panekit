@@ -9,13 +9,21 @@
 pub enum Key {
     /// A literal printable character.
     Char(char),
+    /// The Enter/Return key.
     Enter,
+    /// The Tab key.
     Tab,
+    /// The Backspace key.
     Backspace,
+    /// The Escape key.
     Esc,
+    /// The Up arrow key.
     Up,
+    /// The Down arrow key.
     Down,
+    /// The Left arrow key.
     Left,
+    /// The Right arrow key.
     Right,
     /// `Ctrl` + a letter, e.g. `Key::Ctrl('c')`.
     Ctrl(char),
@@ -25,7 +33,9 @@ pub enum Key {
 /// `C-c`) or a literal character sent with `-l`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TmuxKey {
+    /// A named key token (`Enter`, `C-c`), passed to `send-keys` as-is.
     Named(String),
+    /// A literal character, sent with `send-keys -l`.
     Literal(char),
 }
 
@@ -173,6 +183,24 @@ mod tests {
         assert_eq!(Key::Enter.to_tmux(), TmuxKey::Named("Enter".into()));
         assert_eq!(Key::Esc.to_tmux(), TmuxKey::Named("Escape".into()));
         assert_eq!(Key::Ctrl('c').to_tmux(), TmuxKey::Named("C-c".into()));
+    }
+
+    #[test]
+    fn tmux_encoding_maps_every_variant() {
+        // Every Key variant maps to its exact TmuxKey. Literal for a printable
+        // char; a Named token for each control/navigation key.
+        assert_eq!(Key::Char('z').to_tmux(), TmuxKey::Literal('z'));
+        assert_eq!(Key::Char('é').to_tmux(), TmuxKey::Literal('é'));
+        assert_eq!(Key::Enter.to_tmux(), TmuxKey::Named("Enter".into()));
+        assert_eq!(Key::Tab.to_tmux(), TmuxKey::Named("Tab".into()));
+        assert_eq!(Key::Backspace.to_tmux(), TmuxKey::Named("BSpace".into()));
+        assert_eq!(Key::Esc.to_tmux(), TmuxKey::Named("Escape".into()));
+        assert_eq!(Key::Up.to_tmux(), TmuxKey::Named("Up".into()));
+        assert_eq!(Key::Down.to_tmux(), TmuxKey::Named("Down".into()));
+        assert_eq!(Key::Left.to_tmux(), TmuxKey::Named("Left".into()));
+        assert_eq!(Key::Right.to_tmux(), TmuxKey::Named("Right".into()));
+        assert_eq!(Key::Ctrl('c').to_tmux(), TmuxKey::Named("C-c".into()));
+        assert_eq!(Key::Ctrl('x').to_tmux(), TmuxKey::Named("C-x".into()));
     }
 
     #[test]

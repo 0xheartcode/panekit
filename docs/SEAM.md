@@ -91,6 +91,10 @@ function writeSeam(path, state) {
 // writeSeam("app.state.json", { screen: "list", count: 2 });
 ```
 
+A ready-to-copy version of this, plus a dogfooded example and a driving script,
+lives in [`adapters/node`](../adapters/node). Validate any adapter's output with
+`panedrive validate-seam <file>` and inspect it with `panedrive state --paths`.
+
 ## No seam? Fall back to the screen
 
 If you cannot instrument the target (a third-party TUI), `panedrive run
