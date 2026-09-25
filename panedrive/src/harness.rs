@@ -7,7 +7,7 @@
 //! is its unit-test complement. You construct your model, feed it keys, and
 //! assert over the *same* [`paneview`](https://docs.rs/paneview) seam and the
 //! *same* [`Condition`] grammar, but everything happens in one process with no
-//! terminal, no timing, and no cleanup.
+//! terminal, no settling, and no cleanup.
 //!
 //! It is a thin adapter, not a second engine: [`Harness::run`] reuses the whole
 //! [`run_script`](crate::run_script) runner, with an in-process backend whose
@@ -16,8 +16,10 @@
 //! same keys and checks the same conditions it would over tmux or a PTY, only
 //! synchronously. (Settling is therefore unnecessary and disabled: an
 //! in-process model updates the instant a key is applied, so there is no
-//! asynchronous gap to absorb. A `capture` step yields the empty string, since
-//! there is no rendered screen — the seam is the source of truth.)
+//! asynchronous gap to absorb, and a satisfied `wait-until` returns on its
+//! first poll. A `sleep` step and an *unmet* `wait-until` still consume real
+//! wall-clock time — the runner is reused verbatim. A `capture` step yields the
+//! empty string, since there is no rendered screen — the seam is the truth.)
 //!
 //! # Example
 //!
@@ -84,9 +86,14 @@ pub trait InProcessUi: DumpState {
     /// Apply one logical key press to the model, mutating it in place.
     fn apply_key(&mut self, key: &Key);
 
-    /// Apply literal text. Defaults to one [`Key::Char`] per character, matching
-    /// how the runner types a `type` step; override it if your model handles a
-    /// pasted block differently from individual keystrokes.
+    /// Apply literal text as a block — the paste transport. This backs
+    /// [`Harness::type_text`] and a scripted `type --paste` step. The default
+    /// applies one [`Key::Char`] per character (identical to per-key typing);
+    /// override it only if your model treats a pasted block differently from
+    /// individual keystrokes. A plain `type` step (no `--paste`) always delivers
+    /// per character through [`apply_key`](InProcessUi::apply_key), mirroring how
+    /// the real backends separate keystroke typing from block paste — so an
+    /// override affects `type_text`/`type --paste`, not a plain `type`.
     fn apply_text(&mut self, text: &str) {
         for ch in text.chars() {
             self.apply_key(&Key::Char(ch));
@@ -94,10 +101,12 @@ pub trait InProcessUi: DumpState {
     }
 }
 
-/// A [`PaneBackend`] that delivers keys straight to an in-process model instead
-/// of a pane. `capture` returns the empty string (there is no rendered screen),
-/// and `paste_text` falls back to the default per-character `send_keys`, which
-/// routes through [`InProcessUi::apply_key`] just like real typing.
+/// A [`PaneBackend`] that delivers input straight to an in-process model instead
+/// of a pane: `send_keys` routes each key through [`InProcessUi::apply_key`], and
+/// `paste_text` routes a block through [`InProcessUi::apply_text`] — mirroring how
+/// the real backends separate keystroke typing from block paste, so a scripted
+/// `type --paste` reaches the same code path here. `capture` returns the empty
+/// string (there is no rendered screen — the seam is the truth).
 struct InProcessBackend<'a, M: InProcessUi> {
     model: &'a RefCell<M>,
 }
@@ -114,6 +123,13 @@ impl<M: InProcessUi> PaneBackend for InProcessBackend<'_, M> {
     fn capture(&self) -> io::Result<String> {
         // No terminal in-process: the seam, not the screen, is the truth.
         Ok(String::new())
+    }
+
+    fn paste_text(&self, text: &str) -> io::Result<()> {
+        // Route paste through apply_text (the block transport), not per-key, so
+        // a `type --paste` step exercises the same path as `Harness::type_text`.
+        self.model.borrow_mut().apply_text(text);
+        Ok(())
     }
 }
 
@@ -382,5 +398,54 @@ mod tests {
         backend.send_keys(&[Key::Up, Key::Up]).unwrap();
         assert_eq!(model.borrow().count, 2);
         assert_eq!(backend.capture().unwrap(), "");
+    }
+
+    /// A model whose `apply_text` override is distinguishable from per-key
+    /// typing: a pasted block lands whole in `pasted`, while per-char keystrokes
+    /// accumulate in `keyed`. Lets a test tell which transport a step used.
+    #[derive(Serialize)]
+    struct PasteAware {
+        keyed: String,
+        pasted: String,
+    }
+
+    impl DumpState for PasteAware {
+        fn dump_state(&self) -> Value {
+            dump_serialize(self)
+        }
+    }
+
+    impl InProcessUi for PasteAware {
+        fn apply_key(&mut self, key: &Key) {
+            if let Key::Char(c) = key {
+                self.keyed.push(*c);
+            }
+        }
+        fn apply_text(&mut self, text: &str) {
+            self.pasted.push_str(text);
+        }
+    }
+
+    #[test]
+    fn paste_routes_through_apply_text_while_plain_type_goes_per_key() {
+        // A scripted `type --paste` must reach the apply_text override (block
+        // transport); a plain `type` must go per-key through apply_key. This is
+        // the fidelity contract that mirrors the real tmux/PTY backends.
+        let mut ui = Harness::new(PasteAware {
+            keyed: String::new(),
+            pasted: String::new(),
+        });
+        ui.run("type ab\ntype --paste cd").unwrap();
+        assert_eq!(ui.state()["keyed"], serde_json::json!("ab"));
+        assert_eq!(ui.state()["pasted"], serde_json::json!("cd"));
+
+        // type_text() uses the same block transport as --paste.
+        let mut direct = Harness::new(PasteAware {
+            keyed: String::new(),
+            pasted: String::new(),
+        });
+        direct.type_text("ef");
+        assert_eq!(direct.state()["pasted"], serde_json::json!("ef"));
+        assert_eq!(direct.state()["keyed"], serde_json::json!(""));
     }
 }

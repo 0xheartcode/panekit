@@ -2,8 +2,11 @@
 //! through the [`Harness`], against a model that mirrors the `counter_tui`
 //! example's command loop. `tests/run_script_pty.rs` drives the same kind of
 //! flow over a real PTY; this proves the harness's headline promise — the same
-//! `.pds` script runs identically in-process — using the very file shipped as
-//! the example, so the two paths cannot silently diverge.
+//! shipped `.pds` script parses and runs identically through the in-process
+//! runner, reaching the state the script asserts. (It pins the *script/runner*
+//! path, not model fidelity: the model below re-implements — does not import —
+//! `examples/counter_tui.rs`, so a change to that example's command loop would
+//! not be caught here.)
 
 use panedrive::{Harness, InProcessUi, Key, RunResult};
 use paneview::DumpState;
