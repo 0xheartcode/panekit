@@ -63,12 +63,6 @@ determinism with one shared driver.
 - The state seam is the load-bearing, non-portable half; keep it machine-first
   (stable keys, enums as strings) rather than a mirror of the screen.
 
-## Future
-
-- `ZellijBackend` (`zellij action write` / `dump-screen`).
-- Optional in-process test harness for Rust UIs (inject events into the real
-  model+view) as a unit-test complement to out-of-process driving.
-
 ## Shipped since v0.1
 
 - `PtyBackend` (behind the `pty` feature): spawns the TUI in a pseudo-terminal
@@ -79,3 +73,16 @@ determinism with one shared driver.
   transitions a single assert would miss. Addresses the sampling half of the
   frame-boundary limitation; states the UI never emits remain out of reach (an
   app-side write-on-change concern).
+- `ZellijBackend` (`zellij action write-chars` / `write`, `dump-screen`): a
+  `PaneBackend` that attaches to a running zellij session; the `--pane` value is
+  the session name. One more host behind the same condition/wait/assert layer.
+- `panedrive::harness`: an in-process test harness for Rust UIs. The UI's model
+  implements `InProcessUi: DumpState` (an `apply_key`, plus a provided
+  `apply_text`), and `Harness<M>` feeds it keys and asserts over the *same*
+  `paneview` JSON seam and the *same* condition grammar as the out-of-process
+  driver, in one process with no terminal, no timing, and no cleanup. It reuses
+  the whole `run_script` runner through an in-process backend, so a `.pds` script
+  runs identically here; settling is off (updates are synchronous) and `capture`
+  yields the empty string (no rendered screen). It is the unit-test complement to
+  driving: same seam and conditions at `cargo test` speed, with the tmux/PTY
+  backends reserved for the full-fidelity integration path.

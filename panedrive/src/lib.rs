@@ -17,6 +17,7 @@ pub mod backend;
 pub mod cast;
 pub mod condition;
 pub mod driver;
+pub mod harness;
 pub mod key;
 pub mod record;
 pub mod script;
@@ -28,6 +29,7 @@ pub use backend::{PaneBackend, screen::ScreenBackend, tmux::TmuxBackend, zellij:
 pub use cast::{CastWriter, TmuxCastRecorder};
 pub use condition::{Condition, NumOp, Observed};
 pub use driver::{WaitOutcome, read_state_file, screen_state, wait_until, watch};
+pub use harness::{Harness, InProcessUi};
 pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
 pub use record::ScriptRecorder;
 pub use script::{

@@ -276,6 +276,26 @@ host-specific part:
 Reading state via the JSON seam is backend-independent, so most driving does not
 depend on which host you use.
 
+## In-process harness
+
+For a Rust UI you can also unit-test the model directly, with no process, no
+terminal, and no timing. Implement `InProcessUi` (an `apply_key`, on top of the
+`DumpState` seam you already have) and drive it with `Harness`, asserting over
+the *same* JSON seam and the *same* condition grammar as the CLI driver:
+
+```rust
+use panedrive::harness::Harness;
+
+Harness::new(model)
+    .press("Up")?       // real keybindings, dispatched into your model
+    .assert("count=1")?; // same conditions as `panedrive assert`
+```
+
+It also runs a `.pds` script in-process (`Harness::run`), so the same flow can be
+checked at `cargo test` speed and driven for real over tmux/PTY. Because there is
+no terminal, settling is disabled (updates are synchronous) and `capture` yields
+the empty string.
+
 ## Develop
 
 ```bash
