@@ -8,6 +8,10 @@ Entries are kept on a single line each: cargo-dist injects this file into the Gi
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-25
+
+Ships `panedrive` only. `paneview` is unchanged and stays at 0.1.2.
+
 ### Added
 
 - **In-process test harness** (`panedrive::harness`): `Harness` plus the `InProcessUi` trait (extends `paneview::DumpState`) unit-test a Rust TUI's model against the paneview seam without spawning a process. You feed keys with `press`/`type_text`, read `state()`, and `assert` over the same condition grammar as the driver; `Harness::run` executes a `.pds` script in-process by reusing the whole `run_script` runner behind an in-process backend. Settling is off (updates are synchronous) and `capture` yields the empty string. No new dependencies, no feature flag.

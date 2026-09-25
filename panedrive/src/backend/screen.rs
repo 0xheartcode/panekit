@@ -99,12 +99,25 @@ impl PaneBackend for ScreenBackend {
     }
 }
 
-/// Read `path`, retrying while it does not exist yet (up to ~500ms) so a
-/// just-issued `hardcopy` that has not landed is waited out rather than failing.
+/// Read `path`, retrying while it does not exist yet OR is still empty (up to
+/// ~500ms) so a just-issued `hardcopy` that has not landed — or that has been
+/// created but not yet filled — is waited out rather than returning a spurious
+/// empty capture. `screen`'s `hardcopy` is not atomic (it creates the file, then
+/// writes it), so a reader can briefly catch it existing-but-empty; treating
+/// empty as not-ready-yet rides that window out. After the budget, whatever the
+/// final read yields is returned (an empty capture is then taken at face value).
+///
+/// The two retry guards below are *latency-only* under mutation testing: flipping
+/// them still returns the correct contents, just after the full budget instead of
+/// early, so cargo-mutants reports them as result-equivalent survivors. That is
+/// expected — the contract here is the contents returned, not how fast; this is a
+/// best-effort screen-scrape fallback (the JSON seam is the authoritative state).
 fn read_when_ready(path: &Path) -> io::Result<String> {
     for _ in 0..50 {
         match std::fs::read_to_string(path) {
-            Ok(contents) => return Ok(contents),
+            Ok(contents) if !contents.is_empty() => return Ok(contents),
+            // Exists-but-empty (mid-write): keep polling within budget.
+            Ok(_) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -131,10 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn read_when_ready_retries_until_the_file_appears() {
-        // A path that does not exist yet: read_when_ready must retry over its
-        // NotFound branch rather than failing, then return the contents once a
-        // writer lands the file. The writer sleeps well under the ~500ms budget.
+    fn read_when_ready_rides_out_notfound_and_empty_then_returns_contents() {
+        // read_when_ready must ride out BOTH race windows and still return the
+        // final contents, never a transient empty string:
+        //   (1) the file not existing yet (NotFound), and
+        //   (2) the file existing but still empty because a writer created it and
+        //       fills it a beat later (screen's `hardcopy` is not atomic).
+        // The writer reproduces exactly that create-then-fill sequence, so a
+        // regression that dropped the empty-retry branch would make this fail.
         let path = std::env::temp_dir().join(format!(
             "panedrive-read-when-ready-{}-{:?}.tmp",
             std::process::id(),
@@ -143,6 +160,9 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
+            // Create it empty first, then fill it after a beat: this is the
+            // non-atomic create-then-fill window the reader must not return "".
+            std::fs::write(&writer_path, b"").unwrap();
             std::thread::sleep(Duration::from_millis(30));
             std::fs::write(&writer_path, b"landed").unwrap();
         });
