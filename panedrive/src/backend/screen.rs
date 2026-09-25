@@ -135,6 +135,14 @@ mod tests {
         // A path that does not exist yet: read_when_ready must retry over its
         // NotFound branch rather than failing, then return the contents once a
         // writer lands the file. The writer sleeps well under the ~500ms budget.
+        //
+        // The writer lands the file *atomically* (write a sibling temp, then
+        // rename into place), the same contract real state files use
+        // (`paneview::write_snapshot`). A plain `fs::write` would create the
+        // path and fill it in two steps, so the reader could catch the file
+        // existing-but-empty and return `Ok("")` — a race that made this test
+        // flaky. An atomic rename means the reader only ever sees NotFound
+        // (retry) or the complete contents.
         let path = std::env::temp_dir().join(format!(
             "panedrive-read-when-ready-{}-{:?}.tmp",
             std::process::id(),
@@ -144,7 +152,9 @@ mod tests {
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
-            std::fs::write(&writer_path, b"landed").unwrap();
+            let tmp = writer_path.with_extension("writing");
+            std::fs::write(&tmp, b"landed").unwrap();
+            std::fs::rename(&tmp, &writer_path).unwrap();
         });
         let contents = read_when_ready(&path);
         writer.join().unwrap();
