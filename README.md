@@ -152,11 +152,28 @@ panedrive run login.pds --backend pty --state run.state.json -- ./my-tui --flag
 
 Steps: `press <keys>`, `type <text>` (also `type --from-env VAR` and
 `type --paste ...` for secrets, see below), `wait-until <cond> [--timeout-ms N]
-[--interval-ms N]`, `assert <cond>`, `capture`, `sleep <200ms|1s|N>`. The run
-stops at the first failing `assert`/`wait-until` and maps to the same exit codes
-(`0` all passed, `1` a step failed, `2` usage or backend error). `run` is the
-only way to drive the **PTY** backend from the CLI, because that backend spawns
-and owns the target program, so it must live for the whole script.
+[--interval-ms N]`, `assert <cond>`, `expect-screen <substring>`,
+`expect-no-screen <substring>`, `capture`, `sleep <200ms|1s|N>`. The run stops at
+the first failing step and maps to the same exit codes (`0` all passed, `1` a
+step failed, `2` usage or backend error). `run` is the only way to drive the
+**PTY** backend from the CLI, because that backend spawns and owns the target
+program, so it must live for the whole script.
+
+`assert` / `wait-until` read the structured JSON seam; `expect-screen` /
+`expect-no-screen` match the *rendered* visible text (a literal substring, no
+regex yet), catching layout or clipping bugs a correct seam cannot see, such as a
+key legend that never displays or a stack trace on screen. An unmet
+`expect-screen` / `expect-no-screen` fails the run just like a failing `assert`.
+
+On the **PTY** backend, `run` also fails if the program it spawned exits
+unexpectedly, before the script ends or with a non-zero status, so a crash after
+the last assertion is no longer a false pass. A clean exit (code 0) caused by the
+final step still passes. Pass `--allow-exit` for a script that deliberately quits
+the program. `run --fail-on <substring>` fails the run if the program's output
+ever contains that literal substring (e.g. `panicked`), a continuous guard over
+the output stream distinct from `expect-no-screen`'s point-in-time screen check.
+Both flags are pty-only (a usage error on the attach backends, which own no
+child).
 
 After a key that *changes* state, `wait-until` the new state rather than
 `assert` it immediately: the UI writes its next snapshot asynchronously, so an

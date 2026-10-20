@@ -132,6 +132,56 @@ fn run_maps_the_script_result_to_exit_codes() {
 }
 
 #[test]
+fn fail_on_and_allow_exit_are_rejected_on_attach_backends() {
+    // These flags observe a program the backend owns; only the pty backend
+    // owns its child, so using them with an attach backend is a usage error
+    // (exit 2) rather than a silently ignored flag.
+    let script = write_script("gated", "press Enter\n");
+
+    // Assert the specific usage error, not just exit 2: an attach backend also
+    // exits 2 when it cannot reach its (dummy) pane, so the exit code alone
+    // would not prove the flags were rejected by the gate.
+    let gate_msg = "--fail-on and --allow-exit are supported on the pty backend only";
+
+    let mut with_fail_on = bin();
+    with_fail_on.args(["run"]).arg(&script).args([
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+        "--fail-on",
+        "panicked",
+    ]);
+    let out = with_fail_on.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "--fail-on on a non-pty backend");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(gate_msg),
+        "--fail-on must be rejected by the gate, not fail for another reason"
+    );
+
+    let mut with_allow_exit = bin();
+    with_allow_exit.args(["run"]).arg(&script).args([
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+        "--allow-exit",
+    ]);
+    let out = with_allow_exit.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--allow-exit on a non-pty backend"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(gate_msg),
+        "--allow-exit must be rejected by the gate, not fail for another reason"
+    );
+
+    fs::remove_file(&script).ok();
+}
+
+#[test]
 fn run_reports_backend_selection_errors_as_exit_2() {
     let script = write_script("sel", "press Enter\n");
 

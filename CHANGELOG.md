@@ -6,7 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
 
-## [Unreleased]
+## [0.1.4] - 2026-10-20
+
+Ships `panedrive` only. `paneview` is unchanged and stays at 0.1.2. Theme: stop a run from reporting a false pass.
+
+### Added
+
+- **Screen-text assertions**: `expect-screen <substring>` and `expect-no-screen <substring>` steps in the `run` grammar assert over the pane's *rendered* text, catching layout/clipping bugs (a legend that never shows, a stack trace on screen) that a correct state seam structurally cannot see. Literal substring match for now; regex and golden snapshots are deferred.
+- **Crash detection**: a run now fails when the program the PTY backend owns exits unexpectedly (before the script ends, or with a non-zero status), so a crash *after* the last assertion is no longer reported as a pass. `run --allow-exit` opts out for a script that deliberately quits the program. The new `PaneBackend::child_exit` reports an owned child's status (attach backends own no child, so they are unaffected).
+- **`run --fail-on <substring>`**: fail the run if the program's output ever contains the pattern (e.g. `panicked`), a continuous guard over the program's output stream (pty backend only). Backed by `PaneBackend::output_contains`.
+
+### Changed
+
+- **Behaviour (pty backend)**: by default, a program that exits unexpectedly now fails the run. A script that intends the program to exit must pass `--allow-exit`. A clean exit (code 0) caused by the final step is still a pass, so scripts that quit the app on their last step are unaffected.
+- The PTY backend clears any leftover state-seam file before spawning the program, so a `wait-until` cannot pass immediately on a previous run's stale state before the freshly spawned program has written anything. Attach backends drive a process they do not own, so their seam file is left untouched.
 
 ## [0.1.3] - 2026-09-25
 
@@ -78,7 +91,8 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **Dependency-layering wall** (`make deps`): `panedrive` may depend on `paneview`, never the reverse.
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
-[Unreleased]: https://github.com/0xheartcode/panekit/compare/v0.1.2...HEAD
+[0.1.4]: https://github.com/0xheartcode/panekit/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/0xheartcode/panekit/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/0xheartcode/panekit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/0xheartcode/panekit/releases/tag/v0.1.0
