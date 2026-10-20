@@ -15,15 +15,25 @@
 //! | `type --paste --from-env VAULT_PASS`   | same, via the paste transport     |
 //! | `wait-until count=1 --timeout-ms 2000` | poll the seam until it holds      |
 //! | `assert focus=fleet`                   | check the seam once               |
+//! | `expect-screen 1/2/3 day`              | the visible text must contain it  |
+//! | `expect-no-screen panicked`            | the visible text must NOT         |
 //! | `capture`                              | emit the pane's visible text      |
 //! | `sleep 200ms`                          | pause (`200ms`, `1s`, or bare ms) |
 //!
-//! Exit contract, preserved from the single-shot commands: a failing `assert`
-//! or a timed-out `wait-until` stops the run and yields [`RunResult::Failed`]
-//! (exit 1); a backend or usage error is an `Err` (exit 2); otherwise the run
-//! passes (exit 0).
+//! `assert` / `wait-until` read the structured JSON seam; `expect-screen` /
+//! `expect-no-screen` match the *rendered* text, catching layout or clipping
+//! bugs a correct seam cannot see. Both take a literal substring (no regex yet).
+//!
+//! Exit contract, preserved from the single-shot commands: a failing `assert`,
+//! a timed-out `wait-until`, or an unmet `expect-screen` / `expect-no-screen`
+//! stops the run and yields [`RunResult::Failed`] (exit 1); a backend or usage
+//! error is an `Err` (exit 2); otherwise the run passes (exit 0). Independently,
+//! a run also fails when the program the PTY backend owns exits unexpectedly
+//! (before the script ends, or non-zero) or when its output matches a
+//! [`RunOptions::fail_on`] pattern, so a crash after the last assertion is not
+//! reported as a pass.
 
-use crate::backend::PaneBackend;
+use crate::backend::{ChildExit, PaneBackend};
 use crate::condition::{Condition, Observed};
 use crate::driver::wait_until;
 use crate::key::{self, Key, TmuxKey};
@@ -60,6 +70,10 @@ pub enum Step {
     },
     /// Check a condition against the seam once.
     Assert(Condition),
+    /// Assert the pane's currently visible text contains this literal substring.
+    ExpectScreen(String),
+    /// Assert the pane's currently visible text does NOT contain this substring.
+    ExpectNoScreen(String),
     /// Emit the pane's currently visible text.
     Capture,
     /// Pause for the given duration.
@@ -92,7 +106,8 @@ pub enum RunResult {
 pub struct StepFailure {
     /// 1-based step number in the script.
     pub step: usize,
-    /// The failing verb, `"assert"` or `"wait-until"`.
+    /// The failing verb: `"assert"`, `"wait-until"`, `"expect-screen"`,
+    /// `"expect-no-screen"`, `"child-exit"`, or `"fail-on"`.
     pub kind: &'static str,
     /// The condition spec that failed, in canonical form (`bag.count=2`).
     pub cond: String,
@@ -118,6 +133,29 @@ pub enum FailReason {
         timeout_ms: u64,
         /// The last value the path held before the timeout.
         observed: Observed,
+    },
+    /// An `expect-screen` / `expect-no-screen` step did not hold against the
+    /// pane's rendered text.
+    ScreenMismatch {
+        /// The literal substring the step looked for.
+        pattern: String,
+        /// `true` for `expect-no-screen` (the pattern must be absent), so the
+        /// failure is "it was present"; `false` for `expect-screen`.
+        negate: bool,
+    },
+    /// The program the backend owns exited unexpectedly: before the script
+    /// finished, or with a non-zero status.
+    ChildExited {
+        /// The exit code, or `None` if the platform did not report one.
+        code: Option<i32>,
+        /// `true` when it exited while steps still remained (vs. a non-zero
+        /// exit at the end of the run).
+        early: bool,
+    },
+    /// The program's output matched a [`RunOptions::fail_on`] pattern.
+    OutputMatched {
+        /// The pattern that matched the output.
+        pattern: String,
     },
 }
 
@@ -147,6 +185,37 @@ impl StepFailure {
                 self.cond,
                 observed.describe(&self.path)
             ),
+            FailReason::ScreenMismatch { pattern, negate } => {
+                if *negate {
+                    format!(
+                        "step {}: {} {pattern:?} but the screen contained it",
+                        self.step, self.kind
+                    )
+                } else {
+                    format!(
+                        "step {}: {} {pattern:?} but the screen did not contain it",
+                        self.step, self.kind
+                    )
+                }
+            }
+            FailReason::ChildExited { code, early } => {
+                let code = code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                if *early {
+                    format!(
+                        "step {}: the program exited before the script finished (exit {code})",
+                        self.step
+                    )
+                } else {
+                    format!(
+                        "step {}: the program exited with a non-zero status (exit {code})",
+                        self.step
+                    )
+                }
+            }
+            FailReason::OutputMatched { pattern } => format!(
+                "step {}: the program output matched --fail-on {pattern:?}",
+                self.step
+            ),
         }
     }
 
@@ -171,6 +240,22 @@ impl StepFailure {
                 m.insert("timeout_ms".into(), (*timeout_ms).into());
                 m.insert("actual".into(), observed.to_json());
             }
+            FailReason::ScreenMismatch { pattern, negate } => {
+                m.insert("error".into(), "screen mismatch".into());
+                m.insert("pattern".into(), pattern.clone().into());
+                m.insert("negate".into(), (*negate).into());
+            }
+            FailReason::ChildExited { code, early } => {
+                m.insert("error".into(), "child exited".into());
+                if let Some(c) = code {
+                    m.insert("exit_code".into(), (*c).into());
+                }
+                m.insert("early".into(), (*early).into());
+            }
+            FailReason::OutputMatched { pattern } => {
+                m.insert("error".into(), "output matched".into());
+                m.insert("pattern".into(), pattern.clone().into());
+            }
         }
         Value::Object(m)
     }
@@ -184,7 +269,9 @@ pub struct RunEvent {
     pub t_ms: u64,
     /// 1-based step number.
     pub step: usize,
-    /// The verb: `press`, `type`, `assert`, `wait-until`, `capture`, `sleep`.
+    /// The verb: `press`, `type`, `assert`, `wait-until`, `expect-screen`,
+    /// `expect-no-screen`, `capture`, `sleep`, or a failure kind (`child-exit`,
+    /// `fail-on`) for a run that failed outside a step.
     pub kind: &'static str,
     /// A short description (keys pressed, condition spec, duration). Never a
     /// secret: `type --from-env VAR` records the variable name, not its value.
@@ -255,6 +342,8 @@ impl Step {
             "sleep" => Step::Sleep(parse_duration(rest)?),
             "wait-until" => parse_wait_until(rest)?,
             "assert" => Step::Assert(Condition::parse(first_token(rest)?)?),
+            "expect-screen" => Step::ExpectScreen(parse_pattern(rest, "expect-screen")?),
+            "expect-no-screen" => Step::ExpectNoScreen(parse_pattern(rest, "expect-no-screen")?),
             other => anyhow::bail!("unknown step {other:?}"),
         };
         Ok(Some(step))
@@ -283,10 +372,20 @@ pub struct RunOptions {
     /// gap between a keypress and the UI writing its next snapshot, so a
     /// following `assert` does not race a stale seam. `None` disables settling.
     pub settle: Option<Duration>,
+    /// When `Some(pattern)`, the run fails if the program's output ever contains
+    /// `pattern` (e.g. `panicked`). Only a backend that retains the child's
+    /// output stream (the PTY backend) can match; others never do.
+    pub fail_on: Option<String>,
+    /// When `false` (the default), a backend-owned child that exits before the
+    /// script finishes, or exits with a non-zero status, fails the run, so a
+    /// crash after the last assertion is not read as a pass. Set `true` for a
+    /// script that deliberately quits the program. Attach backends own no child,
+    /// so this never affects them.
+    pub allow_exit: bool,
 }
 
 impl RunOptions {
-    /// Default options: no settling.
+    /// Default options: no settling, no output guard, crashes fail the run.
     pub fn new() -> Self {
         Self::default()
     }
@@ -294,6 +393,19 @@ impl RunOptions {
     /// Enable settling, waiting up to `timeout` after each mutating step.
     pub fn with_settle(mut self, timeout: Duration) -> Self {
         self.settle = Some(timeout);
+        self
+    }
+
+    /// Fail the run if the program's output ever contains `pattern`.
+    pub fn with_fail_on(mut self, pattern: impl Into<String>) -> Self {
+        self.fail_on = Some(pattern.into());
+        self
+    }
+
+    /// Allow the program to exit without failing the run (for scripts that
+    /// deliberately quit it).
+    pub fn with_allow_exit(mut self, allow: bool) -> Self {
+        self.allow_exit = allow;
         self
     }
 }
@@ -471,6 +583,36 @@ pub fn run_script(
                     }));
                 }
             }
+            Step::ExpectScreen(pattern) | Step::ExpectNoScreen(pattern) => {
+                let negate = matches!(step, Step::ExpectNoScreen(_));
+                let kind = if negate {
+                    "expect-no-screen"
+                } else {
+                    "expect-screen"
+                };
+                let present = backend.capture()?.contains(pattern.as_str());
+                let ok = present != negate;
+                sink.on_event(&RunEvent {
+                    t_ms: t_ms(run_start),
+                    step: n,
+                    kind,
+                    detail: pattern.clone(),
+                    ok: Some(ok),
+                    actual: None,
+                });
+                if !ok {
+                    return Ok(RunResult::Failed(StepFailure {
+                        step: n,
+                        kind,
+                        cond: pattern.clone(),
+                        path: "screen".into(),
+                        reason: FailReason::ScreenMismatch {
+                            pattern: pattern.clone(),
+                            negate,
+                        },
+                    }));
+                }
+            }
             Step::WaitUntil {
                 cond,
                 timeout,
@@ -505,8 +647,132 @@ pub fn run_script(
                 }
             }
         }
+        // After every step: a program that crashed/exited unexpectedly, or
+        // output that matched `--fail-on`, fails the run. Attach backends own
+        // no child and retain no output, so this is a no-op for them.
+        if let Some(failure) = child_or_output_failure(backend, opts, n, n == steps.len()) {
+            sink.on_event(&failure_event(t_ms(run_start), &failure));
+            return Ok(RunResult::Failed(failure));
+        }
+    }
+    // A crash can land in the brief window just after the final step. Only wait
+    // for it when that step sent input (the only thing that can trigger one), so
+    // a script ending on a read-only step pays no latency.
+    if !steps.is_empty() {
+        let last_was_input = matches!(steps.last(), Some(Step::Press(_) | Step::Type { .. }));
+        if let Some(failure) = final_child_check(backend, opts, steps.len(), last_was_input) {
+            sink.on_event(&failure_event(t_ms(run_start), &failure));
+            return Ok(RunResult::Failed(failure));
+        }
     }
     Ok(RunResult::Passed)
+}
+
+/// Build the `--events` line for a child-exit / `--fail-on` failure, so every
+/// failure emits an event and the event stream stays coherent (not just the
+/// per-step assertions).
+fn failure_event(t_ms: u64, failure: &StepFailure) -> RunEvent {
+    RunEvent {
+        t_ms,
+        step: failure.step,
+        kind: failure.kind,
+        detail: failure.cond.clone(),
+        ok: Some(false),
+        actual: None,
+    }
+}
+
+/// How long [`final_child_check`] waits after the last step for a program to
+/// flush a crash before the run is declared passed, so a panic right after the
+/// final assertion still fails. Paid once, only on a child-owning backend, and
+/// it returns the instant the child exits.
+const CHILD_EXIT_GRACE_MS: u64 = 150;
+/// Poll cadence for [`final_child_check`]'s grace wait.
+const CHILD_EXIT_POLL_MS: u64 = 10;
+
+/// Fail the run if the program the backend owns exited unexpectedly (before the
+/// script ended, or non-zero) or its output matched `--fail-on`. Returns `None`
+/// for attach backends (no owned child, no retained output) and when all is
+/// well. `is_last` is whether this was the final step, so an intended clean
+/// quit on the last step is not treated as an early exit.
+fn child_or_output_failure(
+    backend: &dyn PaneBackend,
+    opts: &RunOptions,
+    step: usize,
+    is_last: bool,
+) -> Option<StepFailure> {
+    if let Some(pattern) = &opts.fail_on {
+        if backend.output_contains(pattern) {
+            return Some(StepFailure {
+                step,
+                kind: "fail-on",
+                cond: pattern.clone(),
+                path: "output".into(),
+                reason: FailReason::OutputMatched {
+                    pattern: pattern.clone(),
+                },
+            });
+        }
+    }
+    if !opts.allow_exit {
+        if let Some(ChildExit::Exited(code)) = backend.child_exit() {
+            let early = !is_last;
+            let nonzero = code != Some(0);
+            if early || nonzero {
+                return Some(StepFailure {
+                    step,
+                    kind: "child-exit",
+                    cond: "exit".into(),
+                    path: String::new(),
+                    reason: FailReason::ChildExited { code, early },
+                });
+            }
+        }
+    }
+    None
+}
+
+/// After the last step, give a child-owning backend a brief grace to surface a
+/// crash (a non-zero exit, or a `--fail-on` match) that lands just after the
+/// final input. A clean exit, or no owned child, ends the wait at once.
+///
+/// `wait` is whether the last step sent input: only input can trigger a crash,
+/// so a script that ends on a read-only step takes a single immediate check and
+/// pays no latency. The grace is a best-effort window; a crash that takes longer
+/// than [`CHILD_EXIT_GRACE_MS`] to surface after the last keystroke is not caught
+/// here (the per-step checks and `--fail-on` remain the primary guards).
+fn final_child_check(
+    backend: &dyn PaneBackend,
+    opts: &RunOptions,
+    step: usize,
+    wait: bool,
+) -> Option<StepFailure> {
+    // Nothing to guard: exits are allowed and there is no output pattern.
+    if opts.allow_exit && opts.fail_on.is_none() {
+        return None;
+    }
+    // Nothing to wait for: no owned child, or the last step sent no input that
+    // could trigger a crash. A single immediate check (a no-op for attach
+    // backends) suffices.
+    if !wait || backend.child_exit().is_none() {
+        return child_or_output_failure(backend, opts, step, true);
+    }
+    let start = Instant::now();
+    loop {
+        if let Some(failure) = child_or_output_failure(backend, opts, step, true) {
+            return Some(failure);
+        }
+        if matches!(backend.child_exit(), Some(ChildExit::Exited(_))) {
+            // The child has exited. The check above read the status a moment
+            // earlier and found it clean, but re-vet once here to close the gap
+            // between the two reads (a crash landing between them), then stop.
+            return child_or_output_failure(backend, opts, step, true);
+        }
+        if start.elapsed() >= Duration::from_millis(CHILD_EXIT_GRACE_MS) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(CHILD_EXIT_POLL_MS));
+    }
 }
 
 /// After a mutating step, poll the seam until it differs from `before` (or the
@@ -621,6 +887,17 @@ fn first_token(rest: &str) -> anyhow::Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("expected a condition"))
 }
 
+/// The literal substring operand of an `expect-screen` / `expect-no-screen`
+/// step: the rest of the line with surrounding whitespace trimmed. Errors when
+/// empty so a bare `expect-screen` is a usage error, not a match-everything.
+fn parse_pattern(rest: &str, verb: &str) -> anyhow::Result<String> {
+    let pattern = rest.trim();
+    if pattern.is_empty() {
+        anyhow::bail!("{verb} needs a pattern to match");
+    }
+    Ok(pattern.to_string())
+}
+
 /// Parse `200ms`, `1s`, or a bare millisecond count.
 fn parse_duration(raw: &str) -> anyhow::Result<Duration> {
     let raw = raw.trim();
@@ -670,6 +947,29 @@ mod tests {
             Step::parse("assert focus=fleet").unwrap().unwrap(),
             Step::Assert(Condition::parse("focus=fleet").unwrap())
         );
+        assert_eq!(
+            Step::parse("expect-screen 1/2/3 day/week")
+                .unwrap()
+                .unwrap(),
+            Step::ExpectScreen("1/2/3 day/week".to_string())
+        );
+        assert_eq!(
+            Step::parse("expect-no-screen panicked").unwrap().unwrap(),
+            Step::ExpectNoScreen("panicked".to_string())
+        );
+        // The pattern is the whole remainder (spaces kept), surrounding
+        // whitespace trimmed.
+        assert_eq!(
+            Step::parse("expect-screen   padded  ").unwrap().unwrap(),
+            Step::ExpectScreen("padded".to_string())
+        );
+    }
+
+    #[test]
+    fn expect_screen_needs_a_pattern() {
+        assert!(Step::parse("expect-screen").is_err());
+        assert!(Step::parse("expect-screen    ").is_err());
+        assert!(Step::parse("expect-no-screen").is_err());
     }
 
     #[test]
@@ -819,10 +1119,37 @@ mod tests {
     }
 
     fn mock() -> MockBackend {
+        mock_with_screen("SCREEN")
+    }
+
+    fn mock_with_screen(screen: &str) -> MockBackend {
         MockBackend {
             sent: RefCell::new(Vec::new()),
             pasted: RefCell::new(Vec::new()),
-            screen: "SCREEN".to_string(),
+            screen: screen.to_string(),
+        }
+    }
+
+    /// A backend that stands in for the PTY backend in child-exit / output
+    /// tests: it reports a scripted [`ChildExit`] and whether its output has
+    /// contained a needle, without spawning anything.
+    struct ProgramBackend {
+        exit: Option<ChildExit>,
+        output: String,
+    }
+
+    impl PaneBackend for ProgramBackend {
+        fn send_keys(&self, _keys: &[Key]) -> io::Result<()> {
+            Ok(())
+        }
+        fn capture(&self) -> io::Result<String> {
+            Ok(String::new())
+        }
+        fn child_exit(&self) -> Option<ChildExit> {
+            self.exit
+        }
+        fn output_contains(&self, needle: &str) -> bool {
+            self.output.contains(needle)
         }
     }
 
@@ -1099,6 +1426,104 @@ mod tests {
         assert_eq!(j["timeout_ms"], json!(500));
         assert_eq!(j["actual"], json!(null));
         assert!(timed_out.human().contains("timed out after 500 ms"));
+
+        let screen_missing = StepFailure {
+            step: 4,
+            kind: "expect-screen",
+            cond: "Ready".into(),
+            path: "screen".into(),
+            reason: FailReason::ScreenMismatch {
+                pattern: "Ready".into(),
+                negate: false,
+            },
+        };
+        let j = screen_missing.to_json();
+        assert_eq!(j["error"], json!("screen mismatch"));
+        assert_eq!(j["pattern"], json!("Ready"));
+        assert_eq!(j["negate"], json!(false));
+        assert!(
+            screen_missing
+                .human()
+                .contains("expect-screen \"Ready\" but the screen did not contain it")
+        );
+
+        let screen_present = StepFailure {
+            step: 5,
+            kind: "expect-no-screen",
+            cond: "panicked".into(),
+            path: "screen".into(),
+            reason: FailReason::ScreenMismatch {
+                pattern: "panicked".into(),
+                negate: true,
+            },
+        };
+        assert_eq!(screen_present.to_json()["negate"], json!(true));
+        assert!(
+            screen_present
+                .human()
+                .contains("expect-no-screen \"panicked\" but the screen contained it")
+        );
+
+        let crashed = StepFailure {
+            step: 6,
+            kind: "child-exit",
+            cond: "exit".into(),
+            path: String::new(),
+            reason: FailReason::ChildExited {
+                code: Some(101),
+                early: false,
+            },
+        };
+        let j = crashed.to_json();
+        assert_eq!(j["error"], json!("child exited"));
+        assert_eq!(j["exit_code"], json!(101));
+        assert_eq!(j["early"], json!(false));
+        assert!(
+            crashed
+                .human()
+                .contains("exited with a non-zero status (exit 101)")
+        );
+
+        // An early exit, and one with no reported code (killed by a signal).
+        let early_signal = StepFailure {
+            step: 2,
+            kind: "child-exit",
+            cond: "exit".into(),
+            path: String::new(),
+            reason: FailReason::ChildExited {
+                code: None,
+                early: true,
+            },
+        };
+        let j = early_signal.to_json();
+        assert!(
+            j.get("exit_code").is_none(),
+            "an unknown code is omitted from json"
+        );
+        assert_eq!(j["early"], json!(true));
+        assert!(
+            early_signal
+                .human()
+                .contains("exited before the script finished (exit unknown)")
+        );
+
+        let matched = StepFailure {
+            step: 7,
+            kind: "fail-on",
+            cond: "panicked".into(),
+            path: "output".into(),
+            reason: FailReason::OutputMatched {
+                pattern: "panicked".into(),
+            },
+        };
+        let j = matched.to_json();
+        assert_eq!(j["error"], json!("output matched"));
+        assert_eq!(j["pattern"], json!("panicked"));
+        assert!(
+            matched
+                .human()
+                .contains("output matched --fail-on \"panicked\"")
+        );
     }
 
     #[test]
@@ -1170,6 +1595,323 @@ mod tests {
             sink.captured.is_empty(),
             "capture after the failure must not run"
         );
+    }
+
+    #[test]
+    fn expect_screen_checks_rendered_text() {
+        // Present -> passes; absent -> fails, naming the pattern.
+        let backend = mock_with_screen("Loading...\n1/2/3 day/week/month\nReady");
+        let steps = parse_script("expect-screen 1/2/3 day/week/month").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+
+        let steps = parse_script("expect-screen NoSuchLegend").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap() else {
+            panic!("a missing substring must fail");
+        };
+        assert_eq!(f.kind, "expect-screen");
+        assert!(matches!(
+            f.reason,
+            FailReason::ScreenMismatch { negate: false, .. }
+        ));
+    }
+
+    #[test]
+    fn expect_no_screen_checks_absence() {
+        // Absent -> passes; present -> fails. This is the bug class a correct
+        // seam cannot see (a stack trace rendered on screen).
+        let clean = mock_with_screen("all good here");
+        let steps = parse_script("expect-no-screen panicked").unwrap();
+        assert_eq!(
+            run_script(&steps, &clean, &RunOptions::new(), &mut probe_sink(|| None)).unwrap(),
+            RunResult::Passed
+        );
+
+        let crashed = mock_with_screen("thread 'main' panicked at src/x.rs");
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &crashed,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap() else {
+            panic!("a present substring must fail expect-no-screen");
+        };
+        assert_eq!(f.kind, "expect-no-screen");
+        assert!(matches!(
+            f.reason,
+            FailReason::ScreenMismatch { negate: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_zero_child_exit_fails_the_run() {
+        // The program crashes after the last (passing) step; the seam is fine,
+        // but the run must still fail.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(101))),
+            output: String::new(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap() else {
+            panic!("a non-zero exit must fail the run even when the seam passed");
+        };
+        assert_eq!(f.kind, "child-exit");
+        assert!(matches!(
+            f.reason,
+            FailReason::ChildExited {
+                code: Some(101),
+                early: false
+            }
+        ));
+    }
+
+    #[test]
+    fn an_early_child_exit_fails_the_run() {
+        // The program is gone before the script's later steps; exiting before
+        // the end fails even with a zero code.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(0))),
+            output: String::new(),
+        };
+        let steps = parse_script("press a\nassert ready=true").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap() else {
+            panic!("exiting before the script ends must fail");
+        };
+        assert!(matches!(
+            f.reason,
+            FailReason::ChildExited { early: true, .. }
+        ));
+        assert_eq!(
+            f.step, 1,
+            "the failure is reported at the step after which it was seen"
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_on_the_last_step_passes() {
+        // A script that deliberately quits the app on its final step is a pass:
+        // a zero exit at the end is normal, not an early/non-zero crash.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(0))),
+            output: String::new(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+    }
+
+    #[test]
+    fn allow_exit_suppresses_the_child_exit_failure() {
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(1))),
+            output: String::new(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new().with_allow_exit(true),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RunResult::Passed,
+            "--allow-exit must tolerate the exit"
+        );
+    }
+
+    #[test]
+    fn fail_on_matches_the_child_output() {
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Running),
+            output: "booting\nthread panicked at lib.rs\n".to_string(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new().with_fail_on("panicked"),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap() else {
+            panic!("--fail-on must fail a run whose output matched");
+        };
+        assert_eq!(f.kind, "fail-on");
+        assert!(matches!(f.reason, FailReason::OutputMatched { .. }));
+    }
+
+    #[test]
+    fn fail_on_passes_when_the_output_is_clean() {
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Running),
+            output: "booting\nall good\n".to_string(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new().with_fail_on("panicked"),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+    }
+
+    /// A backend whose child reports `Running` for the first `flip_after`
+    /// status reads, then a sticky non-zero `Exited` — to drive
+    /// `final_child_check`'s grace loop deterministically by call count, not
+    /// wall-clock time. Sticky-once-exited mirrors a real `try_wait`.
+    struct ToggleExitBackend {
+        calls: RefCell<u32>,
+        flip_after: u32,
+        code: i32,
+    }
+
+    impl PaneBackend for ToggleExitBackend {
+        fn send_keys(&self, _: &[Key]) -> io::Result<()> {
+            Ok(())
+        }
+        fn capture(&self) -> io::Result<String> {
+            Ok(String::new())
+        }
+        fn child_exit(&self) -> Option<ChildExit> {
+            let mut n = self.calls.borrow_mut();
+            let exited = *n >= self.flip_after;
+            *n += 1;
+            if exited {
+                Some(ChildExit::Exited(Some(self.code)))
+            } else {
+                Some(ChildExit::Running)
+            }
+        }
+    }
+
+    #[test]
+    fn the_grace_loop_catches_a_crash_just_after_the_last_input() {
+        // The child is still Running at the checks right after the last
+        // keystroke, then exits non-zero while the grace loop polls. Because the
+        // last step sent input, the grace is armed, and the loop must catch it.
+        let backend = ToggleExitBackend {
+            calls: RefCell::new(0),
+            flip_after: 2,
+            code: 101,
+        };
+        let steps = parse_script("press x").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap() else {
+            panic!("a crash landing within the grace window must fail the run");
+        };
+        assert_eq!(f.kind, "child-exit");
+        assert!(matches!(
+            f.reason,
+            FailReason::ChildExited { early: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_read_only_last_step_skips_the_grace_wait() {
+        // When the last step is read-only (no input to trigger a crash), the
+        // final check is immediate: a child that is still Running is not waited
+        // on, so the run passes without the grace latency.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Running),
+            output: String::new(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+    }
+
+    #[test]
+    fn child_exit_failure_emits_an_event() {
+        // The event stream must stay coherent: a child-exit failure emits an
+        // event, like every assertion failure, not just an abrupt Failed result.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(1))),
+            output: String::new(),
+        };
+        let steps = parse_script("assert ready=true").unwrap();
+        let mut sink = TestSink::new(|| Some(json!({ "ready": true })));
+        let out = run_script(&steps, &backend, &RunOptions::new(), &mut sink).unwrap();
+        assert!(matches!(out, RunResult::Failed(_)));
+        let last = sink.events.last().expect("an event for the child-exit");
+        assert_eq!(last.kind, "child-exit");
+        assert_eq!(last.ok, Some(false));
+    }
+
+    #[test]
+    fn fail_on_never_matches_an_attach_backend() {
+        // MockBackend does not override output_contains, so it uses the trait
+        // default (`false`). A `--fail-on` run against it must pass: an attach
+        // backend retains no output to match. (If the default were `true`, this
+        // would spuriously fail.)
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_fail_on("panicked"),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
+    }
+
+    #[test]
+    fn attach_backends_never_trip_the_child_exit_guard() {
+        // A backend that owns no child (child_exit None) must pass even though
+        // --allow-exit is off: the guard is for owned processes only.
+        let steps = parse_script("assert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed);
     }
 
     #[test]

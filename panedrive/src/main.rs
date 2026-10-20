@@ -213,6 +213,16 @@ struct RunArgs {
     /// tmux backends (which expose a byte stream); not screen or zellij.
     #[arg(long)]
     cast: Option<PathBuf>,
+    /// pty only: fail the run if the program's output ever contains this
+    /// literal substring (e.g. `panicked`), catching a crash after the last
+    /// assertion that the seam would otherwise miss.
+    #[arg(long, value_name = "PATTERN")]
+    fail_on: Option<String>,
+    /// pty only: do not fail the run when the program exits. By default a
+    /// program that exits before the script ends, or exits non-zero, fails the
+    /// run; set this for a script that deliberately quits the program.
+    #[arg(long)]
+    allow_exit: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -503,10 +513,19 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         json,
         events,
         cast,
+        fail_on,
+        allow_exit,
     } = args;
     if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
         anyhow::bail!("--cast is supported on the pty and tmux backends only");
     }
+    // --fail-on / --allow-exit observe a program the backend owns; only the pty
+    // backend owns its child, so reject them elsewhere rather than silently
+    // ignoring them.
+    if (fail_on.is_some() || allow_exit) && !matches!(backend, Backend::Pty) {
+        anyhow::bail!("--fail-on and --allow-exit are supported on the pty backend only");
+    }
+    let is_pty = matches!(backend, Backend::Pty);
     let text = std::fs::read_to_string(&script)
         .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
     let steps = parse_script(&text)?;
@@ -519,11 +538,24 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let tmux_cast = matches!(backend, Backend::Tmux)
         .then(|| cast.clone())
         .flatten();
+    // The pty backend spawns and owns the program, so a leftover seam file from
+    // a previous run would let a `wait-until` pass immediately on stale state
+    // before the fresh program has written anything (a false pass). Clear it
+    // first so the only state the run ever reads is what this program writes.
+    // Attach backends drive a process they do not own, so their seam file may be
+    // live; leave it untouched.
+    if is_pty && !from_capture {
+        if let Some(p) = state.as_deref() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
     let backend_box = run_backend(backend, pane.clone(), program, rows, cols, pty_cast)?;
     let mut tmux_recorder = start_tmux_cast(pane, tmux_cast)?;
     let b: &dyn PaneBackend = backend_box.as_ref();
     let opts = RunOptions {
         settle: settle.then(|| Duration::from_millis(1000)),
+        fail_on,
+        allow_exit,
     };
     // Read state from the JSON seam, or, with --from-capture, from the pane's
     // visible text wrapped as {screen, lines} for uninstrumented apps.

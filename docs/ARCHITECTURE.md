@@ -86,3 +86,16 @@ determinism with one shared driver.
   yields the empty string (no rendered screen). It is the unit-test complement to
   driving: same seam and conditions at `cargo test` speed, with the tmux/PTY
   backends reserved for the full-fidelity integration path.
+- `expect-screen` / `expect-no-screen` script steps: a point-in-time literal
+  substring check over the *rendered* visible text, not the JSON seam. The seam
+  stays the primary output contract; these catch layout or clipping bugs a
+  correct seam cannot see (a key legend that never displays, a stack trace on
+  screen).
+- Crash detection on the PTY backend: because that backend *owns* the child,
+  `run` fails by default when the program exits unexpectedly (before the script
+  ends, or non-zero), so a crash after the last assertion is not a false pass.
+  `--allow-exit` opts out, and `--fail-on <substring>` fails the run on a literal
+  substring in the program's output stream. The backend also clears any leftover
+  seam file before spawning, so a stale snapshot from a previous run cannot pass
+  a `wait-until` before the fresh program has written. The attach backends own
+  no child, so none of this applies there.
