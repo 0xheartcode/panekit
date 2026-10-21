@@ -8,10 +8,14 @@ in any language can expose a seam by writing the same file, and every
 
 ## The contract
 
-1. **One JSON object.** The file contains a single JSON object describing the
-   state you want to assert on. The shape is entirely yours; conditions address
-   it by dot-path (`bag.count`, `rows.2.status`), and array indices are path
-   segments.
+1. **One JSON object at the root.** The file contains a single JSON object
+   describing the state you want to assert on. The shape is entirely yours;
+   conditions address it by dot-path (`bag.count`, `rows.2.status`). Objects and
+   arrays are allowed as containers and nest freely: an array element is
+   addressed by its index as a path segment (`rows.2.status`). Only the *root*
+   must be an object (so paths have names to start from), and only the *leaves*
+   you assert on need to be scalar (see rule 4). `paneview::check` enforces
+   exactly this, and `panedrive validate-seam` reports it.
 2. **Write it atomically.** Write to a temp file, then `rename` it over the real
    path. `rename` is atomic on the same filesystem, so a reader never sees a
    half-written file. `panedrive` treats an unreadable/partial file as "not
@@ -29,6 +33,22 @@ Drive it the same way regardless of language:
 panedrive wait-until "ready=true" --state app.state.json
 panedrive assert     "screen=list" --state app.state.json
 ```
+
+## Lifecycle: exit and stale files
+
+The newest snapshot stays on disk after your program exits; nothing deletes it
+for you. Two consequences:
+
+- **Assert on a final state by writing it.** If a driver needs to confirm the
+  state your app was in when it quit, emit one last snapshot just before exiting.
+  A read-only step (`assert`, `wait-until`) can then check that last snapshot
+  after a clean exit.
+- **A stale file can lie.** A snapshot left over from a previous run looks
+  exactly like a fresh one. When `panedrive` spawns and owns the program (the
+  pty backend), it clears any existing seam file before spawning, so a leftover
+  cannot be read as the new run's first state. When `panedrive` instead attaches
+  to a process it does not own, it leaves the file alone; point each run at a
+  distinct path, or clear it yourself, if a stale read would mislead you.
 
 ## Adapters
 

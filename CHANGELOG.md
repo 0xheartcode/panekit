@@ -2,9 +2,25 @@
 
 All notable changes to this project are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Both crates (`paneview` and `panedrive`) share one version and are released together.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The two crates (`paneview` and `panedrive`) are versioned and released independently; from 0.1.3 (paneview) and 0.1.4 (panedrive) onward each section names the crate it covers. Earlier sections predate the split, when both crates shared one version.
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
+
+## [paneview 0.1.3] - 2026-10-21
+
+Ships `paneview` only. `panedrive` is unchanged. Theme: make the seam contract one owner's job, and stop the writer from hiding failures. All additive and backward compatible.
+
+### Added
+
+- **`paneview::check`**: validate a value against the seam contract (`Result<(), Vec<Violation>>`), so an app can unit-test its own snapshot without pulling in the driver. `paneview::leaves` and `Leaf` (every assertable dot-path) move here too, so the contract has a single owner; `panedrive`'s `validate-seam` and `state --paths` reuse them unchanged.
+- **`paneview::try_dump_serialize`**: derive a snapshot from a `Serialize` type and surface a serialization failure as an `Err`, for an app that wants to handle the failure itself.
+- **Seam-design guide**: the `paneview` README now documents the conventions (machine-first keys, stable keys, scalar leaves, a count beside a list, enums as lowercase strings, no secrets) and the snapshot lifecycle.
+
+### Changed
+
+- **`dump_serialize` surfaces a failure instead of hiding it**: a serialization failure now yields a self-describing `{"_error": "..."}` marker object rather than `Value::Null`, so a broken snapshot no longer looks like a valid but empty state. The success path is unchanged.
+- **Unique snapshot temp file**: `write_snapshot` writes its temp file under a per-process, per-call name (`<path>.<pid>.<n>.tmp`) before the atomic rename, so two writers aimed at one path (two instances, or parallel tests) can no longer clobber each other's temp file.
+- **Arrays are documented as first-class**: `SEAM.md` and the validator docs state the rule plainly (the root must be an object, nesting and arrays are fine as containers, only asserted leaves must be scalar) with a regression test, so nobody re-derives "no arrays" from the scalar-leaf wording.
 
 ## [0.1.4] - 2026-10-20
 
@@ -91,6 +107,7 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **Dependency-layering wall** (`make deps`): `panedrive` may depend on `paneview`, never the reverse.
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
+[paneview 0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.4...paneview-v0.1.3
 [0.1.4]: https://github.com/0xheartcode/panekit/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/0xheartcode/panekit/compare/v0.1.1...v0.1.2
