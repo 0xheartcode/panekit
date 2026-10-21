@@ -160,6 +160,14 @@ pub enum FailReason {
 }
 
 impl StepFailure {
+    /// Whether this failure was a `wait-until` timeout, the only failure a slow
+    /// or loaded environment can cause spuriously and so the only one
+    /// [`run_with_retries`] retries. An assertion mismatch, a crash, or an
+    /// output match is deterministic and is never retried.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.reason, FailReason::TimedOut { .. })
+    }
+
     /// A one-line human explanation, e.g.
     /// `step 2: assert bag.count=2 did not hold (bag.count was 1)`.
     pub fn human(&self) -> String {
@@ -382,6 +390,10 @@ pub struct RunOptions {
     /// script that deliberately quits the program. Attach backends own no child,
     /// so this never affects them.
     pub allow_exit: bool,
+    /// When `Some(factor)`, every `wait-until` timeout and the `settle` wait are
+    /// multiplied by `factor`, so one script runs on a slow or loaded box
+    /// without editing each step. `None` means a factor of 1 (no scaling).
+    pub timeout_scale: Option<f64>,
 }
 
 impl RunOptions {
@@ -407,6 +419,22 @@ impl RunOptions {
     pub fn with_allow_exit(mut self, allow: bool) -> Self {
         self.allow_exit = allow;
         self
+    }
+
+    /// Scale every `wait-until` timeout and the settle wait by `factor`.
+    pub fn with_timeout_scale(mut self, factor: f64) -> Self {
+        self.timeout_scale = Some(factor);
+        self
+    }
+}
+
+/// Multiply a duration by a scale factor (used for `--timeout-scale`). A
+/// non-positive or non-finite factor is ignored (treated as 1), so a bad value
+/// never makes a timeout zero or negative.
+fn scale_duration(d: Duration, factor: Option<f64>) -> Duration {
+    match factor {
+        Some(f) if f.is_finite() && f > 0.0 => d.mul_f64(f),
+        _ => d,
     }
 }
 
@@ -485,7 +513,7 @@ pub fn run_script(
     opts: &RunOptions,
     sink: &mut dyn RunSink,
 ) -> anyhow::Result<RunResult> {
-    let settle = opts.settle;
+    let settle = opts.settle.map(|d| scale_duration(d, opts.timeout_scale));
     let run_start = Instant::now();
     let t_ms = |start: Instant| start.elapsed().as_millis() as u64;
     for (i, step) in steps.iter().enumerate() {
@@ -618,7 +646,8 @@ pub fn run_script(
                 timeout,
                 interval,
             } => {
-                let outcome = wait_until(cond, *timeout, *interval, || sink.probe());
+                let timeout = scale_duration(*timeout, opts.timeout_scale);
+                let outcome = wait_until(cond, timeout, *interval, || sink.probe());
                 let ok = outcome.is_satisfied();
                 // A final probe gives the event/failure the last observed value.
                 let observed = sink
@@ -649,8 +678,14 @@ pub fn run_script(
         }
         // After every step: a program that crashed/exited unexpectedly, or
         // output that matched `--fail-on`, fails the run. Attach backends own
-        // no child and retain no output, so this is a no-op for them.
-        if let Some(failure) = child_or_output_failure(backend, opts, n, n == steps.len()) {
+        // no child and retain no output, so this is a no-op for them. A clean
+        // exit here fails only if a later step still needs to send input; a
+        // clean quit followed only by read-only steps (reading the last
+        // snapshot) is fine.
+        let input_remains = steps[n..]
+            .iter()
+            .any(|s| matches!(s, Step::Press(_) | Step::Type { .. }));
+        if let Some(failure) = child_or_output_failure(backend, opts, n, input_remains) {
             sink.on_event(&failure_event(t_ms(run_start), &failure));
             return Ok(RunResult::Failed(failure));
         }
@@ -666,6 +701,32 @@ pub fn run_script(
         }
     }
     Ok(RunResult::Passed)
+}
+
+/// Run a script attempt up to `1 + retries` times, retrying only a timeout-class
+/// failure (see [`StepFailure::is_timeout`]). `attempt` performs one whole run
+/// and returns its [`RunResult`]; a caller re-spawns a fresh program and clears
+/// the seam inside it, so each attempt is independent. Returns the terminal
+/// result and how many attempts were made (at least 1).
+///
+/// Only a `wait-until` timeout is retried: it is the one failure a slow or
+/// loaded environment can cause spuriously. An assertion mismatch, a crash, or
+/// an output match is deterministic and returns on the first attempt, so a real
+/// failure is never masked by retrying.
+pub fn run_with_retries(
+    retries: u32,
+    mut attempt: impl FnMut() -> anyhow::Result<RunResult>,
+) -> anyhow::Result<(RunResult, u32)> {
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let result = attempt()?;
+        let retryable = matches!(&result, RunResult::Failed(f) if f.is_timeout());
+        if retryable && attempts <= retries {
+            continue;
+        }
+        return Ok((result, attempts));
+    }
 }
 
 /// Build the `--events` line for a child-exit / `--fail-on` failure, so every
@@ -690,16 +751,21 @@ const CHILD_EXIT_GRACE_MS: u64 = 150;
 /// Poll cadence for [`final_child_check`]'s grace wait.
 const CHILD_EXIT_POLL_MS: u64 = 10;
 
-/// Fail the run if the program the backend owns exited unexpectedly (before the
-/// script ended, or non-zero) or its output matched `--fail-on`. Returns `None`
-/// for attach backends (no owned child, no retained output) and when all is
-/// well. `is_last` is whether this was the final step, so an intended clean
-/// quit on the last step is not treated as an early exit.
+/// Fail the run if the program the backend owns exited unexpectedly or its
+/// output matched `--fail-on`. Returns `None` for attach backends (no owned
+/// child, no retained output) and when all is well.
+///
+/// `input_remains` is whether a later step would still send input (a `press` or
+/// `type`) to the program. A non-zero exit always fails (a crash). A clean exit
+/// (code 0) fails only when input remains: exiting while we still need to drive
+/// it is a real problem, but exiting when only read-only steps are left (an
+/// `assert` or `wait-until` reading the last snapshot) is a clean quit and the
+/// run can still pass.
 fn child_or_output_failure(
     backend: &dyn PaneBackend,
     opts: &RunOptions,
     step: usize,
-    is_last: bool,
+    input_remains: bool,
 ) -> Option<StepFailure> {
     if let Some(pattern) = &opts.fail_on {
         if backend.output_contains(pattern) {
@@ -716,7 +782,7 @@ fn child_or_output_failure(
     }
     if !opts.allow_exit {
         if let Some(ChildExit::Exited(code)) = backend.child_exit() {
-            let early = !is_last;
+            let early = input_remains;
             let nonzero = code != Some(0);
             if early || nonzero {
                 return Some(StepFailure {
@@ -755,18 +821,18 @@ fn final_child_check(
     // could trigger a crash. A single immediate check (a no-op for attach
     // backends) suffices.
     if !wait || backend.child_exit().is_none() {
-        return child_or_output_failure(backend, opts, step, true);
+        return child_or_output_failure(backend, opts, step, false);
     }
     let start = Instant::now();
     loop {
-        if let Some(failure) = child_or_output_failure(backend, opts, step, true) {
+        if let Some(failure) = child_or_output_failure(backend, opts, step, false) {
             return Some(failure);
         }
         if matches!(backend.child_exit(), Some(ChildExit::Exited(_))) {
             // The child has exited. The check above read the status a moment
             // earlier and found it clean, but re-vet once here to close the gap
             // between the two reads (a crash landing between them), then stop.
-            return child_or_output_failure(backend, opts, step, true);
+            return child_or_output_failure(backend, opts, step, false);
         }
         if start.elapsed() >= Duration::from_millis(CHILD_EXIT_GRACE_MS) {
             return None;
@@ -1685,11 +1751,64 @@ mod tests {
     }
 
     #[test]
-    fn an_early_child_exit_fails_the_run() {
-        // The program is gone before the script's later steps; exiting before
-        // the end fails even with a zero code.
+    fn a_clean_exit_before_read_only_steps_passes() {
+        // The quit-app flow: press the quit key, then read the saved state to
+        // confirm it quit. The program exits cleanly (code 0) after the press,
+        // and the only remaining step is a read-only assert against the last
+        // snapshot. That is a clean quit, not an early exit, so the run passes.
         let backend = ProgramBackend {
             exit: Some(ChildExit::Exited(Some(0))),
+            output: String::new(),
+        };
+        let steps = parse_script("press a\nassert ready=true").unwrap();
+        let out = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RunResult::Passed,
+            "a clean exit followed only by read-only steps is a clean quit, not an early exit"
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_before_a_later_input_step_fails() {
+        // A clean exit is still a failure when a later step would send input to
+        // the now-dead program: we cannot drive something that has quit.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(0))),
+            output: String::new(),
+        };
+        let steps = parse_script("press a\npress b").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| Some(json!({ "ready": true }))),
+        )
+        .unwrap() else {
+            panic!("exiting while an input step still remains must fail");
+        };
+        assert!(matches!(
+            f.reason,
+            FailReason::ChildExited { early: true, .. }
+        ));
+        assert_eq!(
+            f.step, 1,
+            "the failure is reported at the step after which it was seen"
+        );
+    }
+
+    #[test]
+    fn a_nonzero_exit_before_read_only_steps_still_fails() {
+        // A crash (non-zero exit) is always a failure, even if only read-only
+        // steps remain: the refined clean-quit rule must not swallow a crash.
+        let backend = ProgramBackend {
+            exit: Some(ChildExit::Exited(Some(3))),
             output: String::new(),
         };
         let steps = parse_script("press a\nassert ready=true").unwrap();
@@ -1700,15 +1819,113 @@ mod tests {
             &mut probe_sink(|| Some(json!({ "ready": true }))),
         )
         .unwrap() else {
-            panic!("exiting before the script ends must fail");
+            panic!("a non-zero exit must fail even with only read-only steps left");
         };
         assert!(matches!(
             f.reason,
-            FailReason::ChildExited { early: true, .. }
+            FailReason::ChildExited {
+                code: Some(3),
+                early: false
+            }
         ));
-        assert_eq!(
-            f.step, 1,
-            "the failure is reported at the step after which it was seen"
+    }
+
+    fn timeout_failure() -> RunResult {
+        RunResult::Failed(StepFailure {
+            step: 1,
+            kind: "wait-until",
+            cond: "ready=true".into(),
+            path: "ready".into(),
+            reason: FailReason::TimedOut {
+                timeout_ms: 100,
+                observed: Observed::Missing,
+            },
+        })
+    }
+
+    fn assert_failure() -> RunResult {
+        RunResult::Failed(StepFailure {
+            step: 1,
+            kind: "assert",
+            cond: "x=1".into(),
+            path: "x".into(),
+            reason: FailReason::Unmet {
+                observed: Observed::Missing,
+            },
+        })
+    }
+
+    #[test]
+    fn run_with_retries_retries_a_timeout_then_passes() {
+        let mut n = 0;
+        let (res, attempts) = run_with_retries(2, || {
+            n += 1;
+            Ok(if n < 3 {
+                timeout_failure()
+            } else {
+                RunResult::Passed
+            })
+        })
+        .unwrap();
+        assert_eq!(attempts, 3, "two timeouts then a pass is three attempts");
+        assert_eq!(res, RunResult::Passed);
+    }
+
+    #[test]
+    fn run_with_retries_does_not_retry_a_non_timeout_failure() {
+        let mut n = 0;
+        let (res, attempts) = run_with_retries(5, || {
+            n += 1;
+            Ok(assert_failure())
+        })
+        .unwrap();
+        assert_eq!(attempts, 1, "a deterministic failure is never retried");
+        assert!(matches!(res, RunResult::Failed(f) if !f.is_timeout()));
+    }
+
+    #[test]
+    fn run_with_retries_exhausts_then_returns_the_last_timeout() {
+        let (res, attempts) = run_with_retries(1, || Ok(timeout_failure())).unwrap();
+        assert_eq!(attempts, 2, "one retry allows at most two attempts");
+        assert!(matches!(res, RunResult::Failed(f) if f.is_timeout()));
+    }
+
+    #[test]
+    fn run_with_retries_zero_runs_once() {
+        let (_res, attempts) = run_with_retries(0, || Ok(timeout_failure())).unwrap();
+        assert_eq!(attempts, 1, "no retries means a single attempt");
+    }
+
+    #[test]
+    fn scale_duration_scales_and_ignores_bad_factors() {
+        let base = Duration::from_millis(100);
+        assert_eq!(scale_duration(base, Some(2.0)), Duration::from_millis(200));
+        assert_eq!(scale_duration(base, None), base);
+        // A non-positive or non-finite factor is ignored, never zeroing a wait.
+        assert_eq!(scale_duration(base, Some(0.0)), base);
+        assert_eq!(scale_duration(base, Some(-1.0)), base);
+        assert_eq!(scale_duration(base, Some(f64::NAN)), base);
+        assert_eq!(scale_duration(base, Some(f64::INFINITY)), base);
+    }
+
+    #[test]
+    fn timeout_scale_reaches_the_wait() {
+        // A wait-until that cannot be satisfied reports the SCALED timeout,
+        // proving the factor reaches the wait, not just scale_duration alone.
+        let steps = parse_script("wait-until ready=true --timeout-ms 20 --interval-ms 5").unwrap();
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_timeout_scale(3.0),
+            &mut probe_sink(|| Some(json!({ "ready": false }))),
+        )
+        .unwrap() else {
+            panic!("an unsatisfiable wait-until must time out");
+        };
+        assert!(
+            matches!(f.reason, FailReason::TimedOut { timeout_ms: 60, .. }),
+            "the reported timeout must be the scaled 60 ms, got {:?}",
+            f.reason
         );
     }
 

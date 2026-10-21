@@ -182,6 +182,60 @@ fn fail_on_and_allow_exit_are_rejected_on_attach_backends() {
 }
 
 #[test]
+fn retry_timeouts_is_rejected_on_attach_backends() {
+    // Retry re-spawns the program, so it needs a child-owning backend. Assert
+    // the specific gate message, since an unreachable dummy pane also exits 2.
+    let script = write_script("retry-gated", "press Enter\n");
+    let gate_msg = "--retry-timeouts is supported on the pty backend only";
+    let mut cmd = bin();
+    cmd.args(["run"]).arg(&script).args([
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+        "--retry-timeouts",
+        "2",
+    ]);
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--retry-timeouts on a non-pty backend"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(gate_msg),
+        "--retry-timeouts must be rejected by the gate"
+    );
+    fs::remove_file(&script).ok();
+}
+
+#[test]
+fn timeout_scale_rejects_a_non_positive_value() {
+    let script = write_script("scale-bad", "press Enter\n");
+    let gate_msg = "--timeout-scale must be a positive number";
+    let mut cmd = bin();
+    cmd.args(["run"]).arg(&script).args([
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+        "--timeout-scale",
+        "0",
+    ]);
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-positive --timeout-scale is a usage error"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(gate_msg),
+        "a non-positive --timeout-scale must be rejected with its own message"
+    );
+    fs::remove_file(&script).ok();
+}
+
+#[test]
 fn run_reports_backend_selection_errors_as_exit_2() {
     let script = write_script("sel", "press Enter\n");
 

@@ -1,78 +1,20 @@
 //! Introspection over a state-seam JSON document.
 //!
-//! Two jobs, both pure functions over a [`serde_json::Value`]:
+//! The seam contract itself lives in [`paneview`], the crate that *defines* the
+//! seam, so the rule has one owner and an app can unit-test its own snapshots
+//! with [`paneview::check`] without pulling in this driver. This module
+//! re-exports that introspection surface and adds the [`SeamReport`] shape the
+//! `validate-seam` command prints.
 //!
 //! - [`leaves`] enumerates every *assertable* dot-path (what `state --paths`
 //!   prints), so you can see the surface a [`Condition`](crate::condition)
 //!   addresses before writing one.
-//! - [`validate`] checks a document against the seam contract, an object with
-//!   scalar leaves, what `validate-seam` reports when bringing up a new
-//!   (often non-Rust) adapter.
+//! - [`validate`] checks a document against the seam contract and reports a
+//!   [`SeamReport`] (ok flag, human-readable problems, path count).
 
 use serde_json::Value;
 
-/// One assertable leaf: its dot-path, the scalar's textual form, and its JSON
-/// type name (`string`, `number`, `bool`, `null`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Leaf {
-    /// The dot-path that addresses this leaf.
-    pub path: String,
-    /// The scalar's value in its textual form.
-    pub value: String,
-    /// The scalar's JSON type name (`string`, `number`, `bool`, `null`).
-    pub kind: &'static str,
-}
-
-/// Every scalar leaf in `root`, as dot-paths. Array elements use numeric
-/// segments (`rows.0.name`); objects and arrays are traversed, not emitted, so
-/// the result is exactly the set of paths a condition can target.
-pub fn leaves(root: &Value) -> Vec<Leaf> {
-    let mut out = Vec::new();
-    walk(root, "", &mut out);
-    out
-}
-
-fn walk(v: &Value, prefix: &str, out: &mut Vec<Leaf>) {
-    match v {
-        Value::Object(map) => {
-            for (k, val) in map {
-                walk(val, &join(prefix, k), out);
-            }
-        }
-        Value::Array(arr) => {
-            for (i, val) in arr.iter().enumerate() {
-                walk(val, &join(prefix, &i.to_string()), out);
-            }
-        }
-        scalar => {
-            if let Some((kind, value)) = scalar_repr(scalar) {
-                out.push(Leaf {
-                    path: prefix.to_string(),
-                    value,
-                    kind,
-                });
-            }
-        }
-    }
-}
-
-fn join(prefix: &str, seg: &str) -> String {
-    if prefix.is_empty() {
-        seg.to_string()
-    } else {
-        format!("{prefix}.{seg}")
-    }
-}
-
-fn scalar_repr(v: &Value) -> Option<(&'static str, String)> {
-    match v {
-        Value::String(s) => Some(("string", s.clone())),
-        Value::Number(n) => Some(("number", n.to_string())),
-        Value::Bool(b) => Some(("bool", b.to_string())),
-        Value::Null => Some(("null", "null".to_string())),
-        Value::Object(_) | Value::Array(_) => None,
-    }
-}
+pub use paneview::{Leaf, Violation, check, leaves};
 
 /// The result of checking a document against the seam contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,27 +27,22 @@ pub struct SeamReport {
     pub paths: usize,
 }
 
-/// Check `root` against the seam contract: it must be a JSON **object** (so
-/// conditions have named paths to address) and expose at least one assertable
-/// leaf. Nesting and arrays are fine; only the shape of the root is constrained.
+/// Check `root` against the seam contract (see [`paneview::check`]) and present
+/// the outcome as a [`SeamReport`] for the `validate-seam` command: an `ok`
+/// flag, the human-readable problems, and how many assertable paths the document
+/// exposes. The contract constrains only the root shape (a non-empty object);
+/// nesting and arrays are fine.
 pub fn validate(root: &Value) -> SeamReport {
-    let mut problems = Vec::new();
-    match root {
-        Value::Object(map) if map.is_empty() => {
-            problems.push("root object is empty: no assertable paths".to_string());
-        }
-        Value::Object(_) => {}
-        Value::Array(_) => {
-            problems.push("root is an array, expected an object".to_string());
-        }
-        _ => {
-            problems.push("root is a scalar, expected an object".to_string());
-        }
-    }
+    let problems = check(root)
+        .err()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.message)
+        .collect::<Vec<_>>();
     SeamReport {
         ok: problems.is_empty(),
-        problems,
         paths: leaves(root).len(),
+        problems,
     }
 }
 
@@ -113,23 +50,6 @@ pub fn validate(root: &Value) -> SeamReport {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn leaves_flattens_nested_objects_and_arrays() {
-        let v = json!({
-            "focus": "fleet",
-            "bag": { "count": 2, "open": true },
-            "rows": [ { "name": "a" }, { "name": "b" } ],
-        });
-        let got: Vec<(String, &str)> = leaves(&v).into_iter().map(|l| (l.path, l.kind)).collect();
-        assert!(got.contains(&("focus".to_string(), "string")));
-        assert!(got.contains(&("bag.count".to_string(), "number")));
-        assert!(got.contains(&("bag.open".to_string(), "bool")));
-        assert!(got.contains(&("rows.0.name".to_string(), "string")));
-        assert!(got.contains(&("rows.1.name".to_string(), "string")));
-        // objects/arrays themselves are not emitted, only their scalar leaves
-        assert_eq!(got.len(), 5);
-    }
 
     #[test]
     fn validate_accepts_an_object_with_leaves() {
@@ -140,9 +60,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_counts_paths_through_arrays() {
+        // The report's path count reflects the reused leaf walk, arrays and all.
+        let report = validate(&json!({
+            "rows": [ { "status": "ok" }, { "status": "down" } ],
+            "count": 2,
+        }));
+        assert!(report.ok);
+        assert_eq!(report.paths, 3);
+    }
+
+    #[test]
     fn validate_rejects_non_object_roots_and_empty_objects() {
         // An array root and a scalar root are both rejected, but with *distinct*
-        // messages, so the array arm cannot be deleted without a test noticing.
+        // messages, so neither arm can be dropped without a test noticing.
         let array = validate(&json!([1, 2, 3]));
         assert!(!array.ok);
         assert!(

@@ -167,13 +167,27 @@ key legend that never displays or a stack trace on screen. An unmet
 
 On the **PTY** backend, `run` also fails if the program it spawned exits
 unexpectedly, before the script ends or with a non-zero status, so a crash after
-the last assertion is no longer a false pass. A clean exit (code 0) caused by the
-final step still passes. Pass `--allow-exit` for a script that deliberately quits
-the program. `run --fail-on <substring>` fails the run if the program's output
-ever contains that literal substring (e.g. `panicked`), a continuous guard over
-the output stream distinct from `expect-no-screen`'s point-in-time screen check.
-Both flags are pty-only (a usage error on the attach backends, which own no
-child).
+the last assertion is no longer a false pass. A non-zero exit always fails. A
+clean exit (code 0) fails only if a later step would still send input to the
+program; a clean quit followed only by read-only steps is fine, so a script that
+quits the app and then asserts its final saved state passes. Pass `--allow-exit`
+for a script that deliberately quits the program. `run --fail-on <substring>`
+fails the run if the program's output ever contains that literal substring (e.g.
+`panicked`), a continuous guard over the output stream distinct from
+`expect-no-screen`'s point-in-time screen check. These flags are pty-only (a
+usage error on the attach backends, which own no child).
+
+`run --json` prints a result summary: `{ "schema": 1, "ok": <bool>, "outcome":
+"passed" | "failed" | "retried", ... }`, an additive superset of earlier
+versions (every older key keeps its meaning). On a failure it adds `failed_step`
+and a `failure` object; the full contract is in `docs/design/outcome-model.md`.
+`run --timeout-scale <factor>` multiplies every `wait-until` timeout and the
+`--settle` wait, so one script runs on a slow or loaded box without editing each
+step. `run --retry-timeouts <N>` (pty backend) re-runs the whole script up to `N`
+more times if it failed because a `wait-until` timed out; only a timeout is
+retried, never an assertion mismatch or a crash. `run --artifacts <dir>` writes a
+bundle on failure (final screen, last seam snapshot, event log, and a manifest)
+so a failure can be inspected without a re-run; secrets are never recorded.
 
 After a key that *changes* state, `wait-until` the new state rather than
 `assert` it immediately: the UI writes its next snapshot asynchronously, so an

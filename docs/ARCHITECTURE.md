@@ -92,10 +92,24 @@ determinism with one shared driver.
   correct seam cannot see (a key legend that never displays, a stack trace on
   screen).
 - Crash detection on the PTY backend: because that backend *owns* the child,
-  `run` fails by default when the program exits unexpectedly (before the script
-  ends, or non-zero), so a crash after the last assertion is not a false pass.
-  `--allow-exit` opts out, and `--fail-on <substring>` fails the run on a literal
-  substring in the program's output stream. The backend also clears any leftover
-  seam file before spawning, so a stale snapshot from a previous run cannot pass
-  a `wait-until` before the fresh program has written. The attach backends own
-  no child, so none of this applies there.
+  `run` fails by default when the program exits unexpectedly, so a crash after
+  the last assertion is not a false pass. A non-zero exit always fails. A clean
+  exit (code 0) fails only when a later step would still send input to the
+  program: a clean quit followed only by read-only steps (an `assert` or
+  `wait-until` reading the last snapshot) is not a failure. `--allow-exit` opts
+  out, and `--fail-on <substring>` fails the run on a literal substring in the
+  program's output stream. The backend also clears any leftover seam file before
+  spawning, so a stale snapshot from a previous run cannot pass a `wait-until`
+  before the fresh program has written. The attach backends own no child, so
+  none of this applies there.
+- The run outcome model (`docs/design/outcome-model.md`): `run --json` emits one
+  envelope carrying a `schema` version, an `outcome` from a closed set
+  (`passed`, `failed`, `retried`), and the 0.1.4 keys unchanged. It is designed
+  so retry (now) and a future matrix or sweep runner extend it without a second
+  reshape. `--timeout-scale` multiplies every wait for a slow box;
+  `--retry-timeouts N` re-runs the whole script on a `wait-until` timeout only
+  (never an assertion or a crash); `--artifacts <dir>` writes a failure bundle
+  (screen, last seam, events, manifest) the summary points at.
+- The seam contract check lives in `paneview` (`paneview::check` / `leaves`), the
+  crate that defines the seam, so the rule has one owner. `panedrive`'s
+  `validate-seam` and `state --paths` reuse it rather than re-implementing it.
