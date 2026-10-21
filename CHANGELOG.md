@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
 
+## [panedrive 0.1.5] - 2026-10-21
+
+Ships `panedrive` only. Theme: a run result you can trust and inspect in CI. The `--json` summary is an additive superset of 0.1.4 (every existing key keeps its name and meaning), so a 0.1.4 consumer keeps working. Reuses `paneview` 0.1.3. See `docs/design/outcome-model.md`.
+
+### Added
+
+- **Result outcome model**: the `run --json` summary now carries `schema` (an integer the consumer can branch on, `1` today), `outcome` (`passed`, `failed`, or `retried`), and, when retried, `attempts`. Exit codes are unchanged (0 pass, 1 fail, 2 usage). The closed outcome set and the envelope are pinned in `docs/design/outcome-model.md`, which also designs it to carry a future matrix or sweep without another reshape.
+- **`run --timeout-scale <factor>`**: multiply every `wait-until` timeout and the `--settle` wait by a factor, so one script runs on a slow or loaded box without editing each step. A non-positive or non-finite factor is a usage error.
+- **`run --retry-timeouts <N>`** (pty backend): if the run fails because a `wait-until` timed out, re-run the whole script up to `N` more times. Only a timeout is retried; an assertion mismatch or a crash is deterministic and is never retried, so a real failure is never masked.
+- **`run --artifacts <dir>`**: on a failed run, write a bundle (final screen, last seam snapshot, event track, and a `manifest.json` that references them and embeds the failure) so a failure can be inspected without a re-run. The `--json` summary points at it. Secret-safe: a `type --from-env` value is never recorded.
+
+### Changed
+
+- **Child-exit, refined**: a clean exit (code 0) no longer fails the run when only read-only steps remain after it. A quit-the-app flow (press the quit key, then `assert` or `wait-until` the final saved state) now passes, where 0.1.4 reported "exited before the script finished". A non-zero exit still always fails, and a clean exit before a later `press`/`type` still fails.
+- The seam contract check now lives in `paneview` (reused via `paneview::check` / `leaves`); `validate-seam` and `state --paths` are unchanged in behaviour. panedrive now depends on paneview 0.1.3.
+
 ## [paneview 0.1.3] - 2026-10-21
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: make the seam contract one owner's job, and stop the writer from hiding failures. All additive and backward compatible.
@@ -107,7 +123,8 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **Dependency-layering wall** (`make deps`): `panedrive` may depend on `paneview`, never the reverse.
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
-[paneview 0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.4...paneview-v0.1.3
+[panedrive 0.1.5]: https://github.com/0xheartcode/panekit/compare/v0.1.4...panedrive-v0.1.5
+[paneview 0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.4...6d7b5df
 [0.1.4]: https://github.com/0xheartcode/panekit/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/0xheartcode/panekit/compare/v0.1.1...v0.1.2

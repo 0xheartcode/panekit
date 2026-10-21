@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use panedrive::{
     ClosureSink, Key, Observed, PaneBackend, RunEvent, RunOptions, RunResult, ScreenBackend,
     TmuxBackend, WaitOutcome, ZellijBackend, condition::Condition, driver, key, parse_script,
-    run_script, seam,
+    run_script, run_with_retries, seam,
 };
 use serde_json::Value;
 
@@ -223,6 +223,21 @@ struct RunArgs {
     /// run; set this for a script that deliberately quits the program.
     #[arg(long)]
     allow_exit: bool,
+    /// Multiply every `wait-until` timeout and the `--settle` wait by this
+    /// factor, so one script runs on a slow or loaded box without editing each
+    /// step. For example `--timeout-scale 2` doubles every wait.
+    #[arg(long, value_name = "FACTOR")]
+    timeout_scale: Option<f64>,
+    /// pty only: if the run fails because a `wait-until` timed out, re-run the
+    /// whole script up to this many more times. Only a timeout is retried; an
+    /// assertion mismatch or a crash is deterministic and never retried.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    retry_timeouts: u32,
+    /// On failure, write a small bundle (final screen, last seam snapshot, event
+    /// log, and a manifest) to this directory so a failure can be inspected
+    /// without a re-run. Secrets from `type --from-env` are never recorded.
+    #[arg(long, value_name = "DIR")]
+    artifacts: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -515,6 +530,9 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         cast,
         fail_on,
         allow_exit,
+        timeout_scale,
+        retry_timeouts,
+        artifacts,
     } = args;
     if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
         anyhow::bail!("--cast is supported on the pty and tmux backends only");
@@ -524,6 +542,21 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // ignoring them.
     if (fail_on.is_some() || allow_exit) && !matches!(backend, Backend::Pty) {
         anyhow::bail!("--fail-on and --allow-exit are supported on the pty backend only");
+    }
+    // Retry re-spawns the program for each attempt, so it needs a backend that
+    // owns its child. Attach backends drive a process they do not own.
+    if retry_timeouts > 0 && !matches!(backend, Backend::Pty) {
+        anyhow::bail!("--retry-timeouts is supported on the pty backend only");
+    }
+    // A cast records one spawned session; re-spawning for a retry would clobber
+    // it, so the two are not combined.
+    if retry_timeouts > 0 && cast.is_some() {
+        anyhow::bail!("--retry-timeouts cannot be combined with --cast");
+    }
+    if let Some(f) = timeout_scale {
+        if !(f.is_finite() && f > 0.0) {
+            anyhow::bail!("--timeout-scale must be a positive number");
+        }
     }
     let is_pty = matches!(backend, Backend::Pty);
     let text = std::fs::read_to_string(&script)
@@ -538,85 +571,148 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let tmux_cast = matches!(backend, Backend::Tmux)
         .then(|| cast.clone())
         .flatten();
-    // The pty backend spawns and owns the program, so a leftover seam file from
-    // a previous run would let a `wait-until` pass immediately on stale state
-    // before the fresh program has written anything (a false pass). Clear it
-    // first so the only state the run ever reads is what this program writes.
-    // Attach backends drive a process they do not own, so their seam file may be
-    // live; leave it untouched.
-    if is_pty && !from_capture {
-        if let Some(p) = state.as_deref() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-    let backend_box = run_backend(backend, pane.clone(), program, rows, cols, pty_cast)?;
-    let mut tmux_recorder = start_tmux_cast(pane, tmux_cast)?;
-    let b: &dyn PaneBackend = backend_box.as_ref();
+    let mut tmux_recorder = start_tmux_cast(pane.clone(), tmux_cast)?;
     let opts = RunOptions {
         settle: settle.then(|| Duration::from_millis(1000)),
         fail_on,
         allow_exit,
+        timeout_scale,
     };
-    // Read state from the JSON seam, or, with --from-capture, from the pane's
-    // visible text wrapped as {screen, lines} for uninstrumented apps.
-    let mut probe: Box<dyn FnMut() -> Option<serde_json::Value>> = if from_capture {
-        Box::new(move || b.capture().ok().map(|text| driver::screen_state(&text)))
-    } else {
-        Box::new(move || state.as_deref().and_then(driver::read_state_file))
+    let state_ref = state.as_deref();
+
+    // One attempt: clear a stale seam (pty only), spawn the program, run the
+    // script, and record this attempt's events / final screen / last snapshot so
+    // the terminal attempt's data is available for artefacts and the summary.
+    // `run_with_retries` re-runs this only on a timeout-class failure.
+    let mut last_events: Vec<RunEvent> = Vec::new();
+    let mut last_screen: Option<String> = None;
+    let mut last_seam: Option<Value> = None;
+    let attempt = || -> anyhow::Result<RunResult> {
+        // The pty backend spawns and owns the program, so a leftover seam file
+        // from a previous run (or a previous attempt) would let a `wait-until`
+        // pass immediately on stale state before the fresh program has written
+        // anything (a false pass). Clear it first. Attach backends drive a
+        // process they do not own, so their seam file may be live; leave it.
+        if is_pty && !from_capture {
+            if let Some(p) = state_ref {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let backend_box = run_backend(
+            backend,
+            pane.clone(),
+            program.clone(),
+            rows,
+            cols,
+            pty_cast.clone(),
+        )?;
+        let b: &dyn PaneBackend = backend_box.as_ref();
+        let mut collected: Vec<RunEvent> = Vec::new();
+        let mut probe: Box<dyn FnMut() -> Option<Value>> = if from_capture {
+            Box::new(|| b.capture().ok().map(|text| driver::screen_state(&text)))
+        } else {
+            Box::new(move || state_ref.and_then(driver::read_state_file))
+        };
+        let outcome = {
+            let mut sink = ClosureSink::new(
+                &mut probe,
+                |screen: &str| print!("{screen}"),
+                |e: &RunEvent| collected.push(e.clone()),
+            );
+            run_script(&steps, b, &opts, &mut sink)?
+        };
+        // Capture this attempt's artefact inputs before the backend (and its
+        // child) drops at the end of the closure.
+        last_screen = b.capture().ok();
+        last_seam = if from_capture {
+            last_screen.as_deref().map(driver::screen_state)
+        } else {
+            state_ref.and_then(driver::read_state_file)
+        };
+        last_events = collected;
+        Ok(outcome)
     };
-    let mut events_file = match &events {
-        Some(p) => Some(
-            std::fs::File::create(p)
-                .map_err(|e| anyhow::anyhow!("creating events file {}: {e}", p.display()))?,
-        ),
-        None => None,
-    };
-    let mut collected: Vec<RunEvent> = Vec::new();
-    // Scope the sink so its borrow of `collected`/`events_file` ends before we
-    // read `collected` for the summary below.
-    let outcome = {
-        let mut sink = ClosureSink::new(
-            &mut probe,
-            |screen: &str| print!("{screen}"),
-            |e: &RunEvent| {
-                if let Some(f) = events_file.as_mut() {
-                    let _ = writeln!(f, "{}", e.to_json());
-                }
-                if json {
-                    collected.push(e.clone());
-                }
-            },
-        );
-        run_script(&steps, b, &opts, &mut sink)?
-    };
+    let (outcome, attempts) = run_with_retries(retry_timeouts, attempt)?;
+
     // Flush and finalize the tmux cast (drops the pipe, joins the tail).
     if let Some(r) = tmux_recorder.as_mut() {
         r.stop();
     }
-    let steps_json: Vec<Value> = collected.iter().map(RunEvent::to_json).collect();
-    match outcome {
-        RunResult::Passed => {
-            if json {
-                println!("{}", serde_json::json!({ "ok": true, "steps": steps_json }));
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        RunResult::Failed(failure) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": false, "failed_step": failure.step,
-                        "failure": failure.to_json(), "steps": steps_json,
-                    })
-                );
-            } else {
-                eprintln!("{}", failure.human());
-            }
-            Ok(ExitCode::from(1))
+
+    // Persist the terminal attempt's events to the --events file, if any.
+    if let Some(p) = &events {
+        let mut f = std::fs::File::create(p)
+            .map_err(|e| anyhow::anyhow!("creating events file {}: {e}", p.display()))?;
+        for e in &last_events {
+            writeln!(f, "{}", e.to_json())?;
         }
     }
+
+    let ok = matches!(outcome, RunResult::Passed);
+    let retried = attempts > 1;
+    let outcome_label = if retried {
+        "retried"
+    } else if ok {
+        "passed"
+    } else {
+        "failed"
+    };
+
+    // On failure, write the artefact bundle and point the summary at it.
+    let artifact_paths = match (&outcome, &artifacts) {
+        (RunResult::Failed(failure), Some(dir)) => Some(
+            panedrive::write_bundle(
+                dir,
+                last_screen.as_deref(),
+                last_seam.as_ref(),
+                &last_events,
+                &failure.to_json(),
+            )
+            .map_err(|e| anyhow::anyhow!("writing artifacts to {}: {e}", dir.display()))?,
+        ),
+        _ => None,
+    };
+
+    let steps_json: Vec<Value> = last_events.iter().map(RunEvent::to_json).collect();
+    let mut summary = serde_json::Map::new();
+    summary.insert("schema".into(), serde_json::json!(OUTCOME_SCHEMA));
+    summary.insert("ok".into(), serde_json::json!(ok));
+    summary.insert("outcome".into(), serde_json::json!(outcome_label));
+    if retried {
+        summary.insert("attempts".into(), serde_json::json!(attempts));
+    }
+    if let RunResult::Failed(failure) = &outcome {
+        summary.insert("failed_step".into(), serde_json::json!(failure.step));
+        summary.insert("failure".into(), failure.to_json());
+    }
+    if let Some(ap) = &artifact_paths {
+        summary.insert("artifacts".into(), ap.to_json());
+    }
+    summary.insert("steps".into(), serde_json::json!(steps_json));
+
+    if json {
+        println!("{}", Value::Object(summary));
+    } else {
+        if let RunResult::Failed(failure) = &outcome {
+            eprintln!("{}", failure.human());
+        }
+        if retried {
+            eprintln!(
+                "note: run {} after {attempts} attempts",
+                if ok { "passed" } else { "failed" }
+            );
+        }
+    }
+    if ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
+
+/// The `schema` version stamped on every `run` summary. Bumped only on a
+/// breaking change to the summary envelope (see `docs/design/outcome-model.md`).
+const OUTCOME_SCHEMA: u32 = 1;
 
 /// Start a tmux `--cast` recorder when a cast path is set. Encapsulates the
 /// `--pane` requirement and file creation so `cmd_run` never branches on the

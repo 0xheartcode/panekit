@@ -13,6 +13,7 @@
 //! `docs/ARCHITECTURE.md`.
 #![deny(missing_docs)]
 
+pub mod artifacts;
 pub mod backend;
 pub mod cast;
 pub mod condition;
@@ -23,6 +24,7 @@ pub mod record;
 pub mod script;
 pub mod seam;
 
+pub use artifacts::{ArtifactPaths, write_bundle};
 #[cfg(feature = "pty")]
 pub use backend::pty::PtyBackend;
 pub use backend::{
@@ -36,5 +38,5 @@ pub use key::{Key, TmuxKey, ZellijKey, parse_keys};
 pub use record::ScriptRecorder;
 pub use script::{
     ClosureSink, FailReason, RunEvent, RunOptions, RunResult, RunSink, Step, StepFailure,
-    TypeSource, parse_script, probe_sink, run_script,
+    TypeSource, parse_script, probe_sink, run_script, run_with_retries,
 };
