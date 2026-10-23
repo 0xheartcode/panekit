@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
 
-## [panedrive 0.1.6] - 2026-10-22
+## [panedrive 0.1.6] - 2026-10-23
 
 Ships `panedrive` only. Theme: CI robustness and honest input timing. Additive and backward compatible. Reuses `paneview` 0.1.4 for the `_meta.seq` frame counter.
 
@@ -21,7 +21,7 @@ Ships `panedrive` only. Theme: CI robustness and honest input timing. Additive a
 - **Relocatable failure bundle**: the `--artifacts` `manifest.json` now references its members (`screen.txt`, `seam.json`, `events.jsonl`) by bare basename instead of the absolute path they were written at, so the bundle can be uploaded as a CI artifact and inspected after it is downloaded on another machine. The run summary's `artifacts` object keeps full paths for the operator on the machine that ran.
 - panedrive now depends on paneview 0.1.4.
 
-## [paneview 0.1.4] - 2026-10-22
+## [paneview 0.1.4] - 2026-10-23
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.
 
@@ -148,6 +148,8 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **Dependency-layering wall** (`make deps`): `panedrive` may depend on `paneview`, never the reverse.
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
+[panedrive 0.1.6]: https://github.com/0xheartcode/panekit/compare/panedrive-v0.1.5...v0.1.6
+[paneview 0.1.4]: https://github.com/0xheartcode/panekit/compare/panedrive-v0.1.5...v0.1.6
 [panedrive 0.1.5]: https://github.com/0xheartcode/panekit/compare/v0.1.4...panedrive-v0.1.5
 [paneview 0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.4...6d7b5df
 [0.1.4]: https://github.com/0xheartcode/panekit/compare/v0.1.3...v0.1.4
