@@ -28,6 +28,12 @@ const OUTPUT_CAP: usize = 1 << 20; // 1 MiB
 pub struct PtyBackend {
     writer: Mutex<Box<dyn Write + Send>>,
     screen: Arc<Mutex<vt100::Parser>>,
+    // The most recent non-blank rendered frame. A TUI that quits restores the
+    // primary screen (the leave-alt-screen sequence), blanking `screen`, so a
+    // post-exit capture would otherwise see nothing. This retains the last
+    // meaningful frame; `capture` falls back to it once the child has exited, so
+    // an `expect-screen` after a clean quit can still assert the final screen.
+    last_frame: Arc<Mutex<Option<String>>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     // A bounded, lossy-UTF-8 copy of the child's output stream, scanned by
     // `output_contains` for the `--fail-on` guard.
@@ -104,6 +110,8 @@ impl PtyBackend {
 
         let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let sink = Arc::clone(&screen);
+        let last_frame = Arc::new(Mutex::new(None));
+        let lf_sink = Arc::clone(&last_frame);
         let output = Arc::new(Mutex::new(String::new()));
         let out_sink = Arc::clone(&output);
         let reader_thread = std::thread::spawn(move || {
@@ -114,6 +122,15 @@ impl PtyBackend {
                     Ok(n) => {
                         if let Ok(mut parser) = sink.lock() {
                             parser.process(&buf[..n]);
+                            // Retain the last non-blank frame. A quit restores the
+                            // (blank) primary screen, which we must not record over
+                            // the real final frame, so blank snapshots are ignored.
+                            let frame = parser.screen().contents();
+                            if !frame.trim().is_empty() {
+                                if let Ok(mut lf) = lf_sink.lock() {
+                                    *lf = Some(frame);
+                                }
+                            }
                         }
                         if let Ok(mut recorded) = out_sink.lock() {
                             recorded.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -130,6 +147,7 @@ impl PtyBackend {
         Ok(Self {
             writer: Mutex::new(writer),
             screen,
+            last_frame,
             child: Mutex::new(child),
             output,
             _master: pair.master,
@@ -175,11 +193,25 @@ impl PaneBackend for PtyBackend {
     }
 
     fn capture(&self) -> io::Result<String> {
-        let parser = self
-            .screen
-            .lock()
-            .map_err(|_| io::Error::other("pty screen poisoned"))?;
-        Ok(parser.screen().contents())
+        let current = {
+            let parser = self
+                .screen
+                .lock()
+                .map_err(|_| io::Error::other("pty screen poisoned"))?;
+            parser.screen().contents()
+        };
+        // While the child runs, always report the live screen (unchanged
+        // behaviour). Only once it has exited, and only if the live screen is now
+        // blank (a quit restored the primary screen), fall back to the last
+        // non-blank frame so a post-exit expect-screen still sees the final UI.
+        if current.trim().is_empty() && !matches!(self.child_exit(), Some(ChildExit::Running)) {
+            if let Ok(lf) = self.last_frame.lock() {
+                if let Some(frame) = lf.as_ref() {
+                    return Ok(frame.clone());
+                }
+            }
+        }
+        Ok(current)
     }
 
     fn child_exit(&self) -> Option<ChildExit> {

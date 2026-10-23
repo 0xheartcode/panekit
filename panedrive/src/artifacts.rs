@@ -87,11 +87,23 @@ pub fn write_bundle(
     std::fs::write(&events_path, body)?;
     paths.events = Some(events_path);
 
+    // The manifest lives inside the bundle, so it names its members by bare
+    // filename, never the (often absolute) path they were written at. That keeps
+    // the bundle relocatable: uploaded as a CI artifact and downloaded on another
+    // machine, the manifest still points at its siblings. (The run summary's
+    // `artifacts` object, emitted live on the machine that ran, keeps full paths
+    // so an operator can open the local bundle.)
+    let member = |p: &Option<PathBuf>| -> Option<String> {
+        p.as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    };
     let manifest = json!({
         "failure": failure,
-        "screen": paths.screen.as_ref().map(|p| p.display().to_string()),
-        "seam": paths.seam.as_ref().map(|p| p.display().to_string()),
-        "events": paths.events.as_ref().map(|p| p.display().to_string()),
+        "screen": member(&paths.screen),
+        "seam": member(&paths.seam),
+        "events": member(&paths.events),
     });
     std::fs::write(&paths.manifest, serde_json::to_vec_pretty(&manifest)?)?;
     Ok(paths)
@@ -154,6 +166,19 @@ mod tests {
         let manifest: Value =
             serde_json::from_slice(&std::fs::read(&paths.manifest).unwrap()).unwrap();
         assert_eq!(manifest["failure"], failure);
+
+        // The manifest names its members by bare basename, not the absolute path
+        // they were written at (`dir` is absolute), so the bundle is relocatable.
+        assert_eq!(manifest["screen"], json!("screen.txt"));
+        assert_eq!(manifest["seam"], json!("seam.json"));
+        assert_eq!(manifest["events"], json!("events.jsonl"));
+        for key in ["screen", "seam", "events"] {
+            let v = manifest[key].as_str().unwrap();
+            assert!(
+                !v.contains('/') && !v.contains('\\'),
+                "manifest member `{key}` must be a bundle-relative basename, got {v:?}"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

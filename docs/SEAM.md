@@ -26,6 +26,11 @@ in any language can expose a seam by writing the same file, and every
 4. **Keep values scalar where you assert.** Conditions compare scalar leaves
    (string/number/bool). Numbers and booleans compare by text (`count=2` matches
    `2` or `2.0`); `~=` matches substrings; `>` `<` `>=` `<=` compare numerically.
+5. **`_meta` is reserved.** A top-level key named `_meta` is reserved for the
+   writer and the driver, not your app state. The Rust `SnapshotWriter` puts a
+   monotonic frame counter at `_meta.seq` (incremented only when the state
+   actually changed) so a driver can tell a fresh frame from a stale file. Your
+   own state goes in your own keys; leave `_meta` to the tooling.
 
 Drive it the same way regardless of language:
 

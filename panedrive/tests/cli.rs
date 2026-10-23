@@ -503,3 +503,83 @@ fn run_over_tmux_emits_json_events_and_a_cast() {
     fs::remove_file(&events).ok();
     fs::remove_file(&cast).ok();
 }
+
+#[test]
+fn inline_steps_run_without_a_script_file() {
+    let state = write_state("inline-run", r#"{ "focus": "fleet" }"#);
+
+    // `-e` lines run exactly like a file; a holding assert exits 0.
+    let mut pass = bin();
+    pass.args(["run", "-e", "assert focus=fleet"])
+        .args(["--backend", "tmux", "--pane", "dummy", "--state"])
+        .arg(&state);
+    assert_eq!(code(pass), 0, "an inline holding assert exits 0");
+
+    // Multiple `-e` lines compose into one script; a failing one exits 1.
+    let mut fail = bin();
+    fail.args(["run", "-e", "assert focus=fleet", "-e", "assert focus=nope"])
+        .args(["--backend", "tmux", "--pane", "dummy", "--state"])
+        .arg(&state);
+    assert_eq!(code(fail), 1, "a failing inline assert exits 1");
+
+    fs::remove_file(&state).ok();
+}
+
+#[test]
+fn run_rejects_both_or_neither_script_source() {
+    let script = write_script("source-gate", "assert focus=fleet\n");
+
+    // A path and `-e` together is ambiguous: a usage error.
+    let mut both = bin();
+    both.args(["run"]).arg(&script).args([
+        "-e",
+        "assert focus=fleet",
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+    ]);
+    assert_eq!(code(both), 2, "a path plus -e is a usage error");
+
+    // Neither a path nor `-e`: nothing to run, a usage error.
+    let mut neither = bin();
+    neither.args(["run", "--backend", "tmux", "--pane", "dummy"]);
+    assert_eq!(code(neither), 2, "no script and no -e is a usage error");
+
+    fs::remove_file(&script).ok();
+}
+
+#[test]
+fn run_rejects_settle_and_ack_together() {
+    let script = write_script("settle-ack", "assert focus=fleet\n");
+    let mut cmd = bin();
+    cmd.args(["run"]).arg(&script).args([
+        "--settle",
+        "--ack",
+        "--backend",
+        "tmux",
+        "--pane",
+        "dummy",
+    ]);
+    assert_eq!(code(cmd), 2, "--settle with --ack is a usage error");
+    fs::remove_file(&script).ok();
+}
+
+#[test]
+fn run_accepts_a_single_wait_flag() {
+    // Exactly one of --settle/--ack is fine; only passing *both* is the error.
+    // This pins the gate as AND, not OR: an OR gate would wrongly reject a lone
+    // flag with exit 2.
+    let state = write_state("one-wait", r#"{ "focus": "fleet" }"#);
+    let script = write_script("one-wait", "assert focus=fleet\n");
+    for flag in ["--settle", "--ack"] {
+        let mut cmd = bin();
+        cmd.args(["run"])
+            .arg(&script)
+            .args([flag, "--backend", "tmux", "--pane", "dummy", "--state"])
+            .arg(&state);
+        assert_eq!(code(cmd), 0, "{flag} alone on a holding script should pass");
+    }
+    fs::remove_file(&state).ok();
+    fs::remove_file(&script).ok();
+}
