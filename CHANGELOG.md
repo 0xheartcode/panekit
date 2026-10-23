@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
 
+## [paneview 0.1.4] - 2026-10-22
+
+Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.
+
+### Added
+
+- **`SnapshotWriter`**: a stateful writer for a render loop. It stamps each snapshot it writes with a monotonic frame counter at `_meta.seq` (the first write is `1`), so a driver can tell a fresh frame from a stale file and confirm a keypress produced a new frame, and it skips the write entirely when the state is unchanged from the last one it wrote, so a redraw without a state change does not churn the file (`seq` advances only on a real change). `without_meta` turns the stamp off; `seq()` reads the counter.
+- **`paneview::write_snapshot_from_env`** and **`SnapshotWriter::from_env`**: write to (or target) the path named by `PANEDRIVE_STATE`, the same variable `panedrive` reads, so an app lands its snapshot where the driver looks with no hand-synced path. The free function is a one-liner that is a no-op when the variable is unset, so an app not under a driver pays almost nothing; `from_env` returns `Option<SnapshotWriter>` for the counter-and-skip path. `paneview::STATE_ENV` names the variable.
+- **`paneview::testing::assert_snapshot_contains`**: a partial-match assertion for an app's own unit tests. It checks that a snapshot contains the named fields (extra keys, extra trailing array elements, and the `_meta` stamp are ignored) and panics with the dot-path and both values on a mismatch, pointing the panic at the caller.
+
 ## [panedrive 0.1.5] - 2026-10-21
 
 Ships `panedrive` only. Theme: a run result you can trust and inspect in CI. The `--json` summary is an additive superset of 0.1.4 (every existing key keeps its name and meaning), so a 0.1.4 consumer keeps working. Reuses `paneview` 0.1.3. See `docs/design/outcome-model.md`.

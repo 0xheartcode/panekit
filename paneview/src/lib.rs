@@ -101,13 +101,146 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// app instances or parallel tests, cannot clobber each other's temp file before
 /// the rename. The rename itself is atomic on the same filesystem.
 pub fn write_snapshot(state: &impl DumpState, path: &Path) -> io::Result<()> {
-    let json = serde_json::to_vec_pretty(&state.dump_state())?;
+    write_value_atomic(&state.dump_state(), path)
+}
+
+/// Atomically write an already-computed snapshot value to `path` (the shared
+/// core of [`write_snapshot`] and [`SnapshotWriter`]): bytes to a unique sibling
+/// temp file, then a rename into place.
+fn write_value_atomic(value: &Value, path: &Path) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(value)?;
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.{}.tmp", std::process::id(), seq));
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)
+}
+
+/// The environment variable that names the seam snapshot path. `panedrive` reads
+/// it as the default for its `--state` option, so an app that writes its snapshot
+/// here lands exactly where the driver looks. It is the single rendezvous point
+/// between the app (which writes) and the driver (which reads).
+pub const STATE_ENV: &str = "PANEDRIVE_STATE";
+
+/// Write a snapshot to the path named by [`STATE_ENV`] (`PANEDRIVE_STATE`) when
+/// it is set, otherwise do nothing. Returns `Ok(true)` when a snapshot was
+/// written and `Ok(false)` when the variable was unset or empty: a deliberate
+/// no-op, since an app not under a driver has nothing to write and should pay
+/// almost nothing for the call.
+///
+/// This is the one-liner form, with no frame counter and no skip-unchanged. Hold
+/// a [`SnapshotWriter::from_env`] instead when you want those. Drop it straight
+/// into a render loop:
+///
+/// ```no_run
+/// # struct App;
+/// # impl paneview::DumpState for App {
+/// #     fn dump_state(&self) -> serde_json::Value { serde_json::json!({ "n": 1 }) }
+/// # }
+/// # let app = App;
+/// paneview::write_snapshot_from_env(&app)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn write_snapshot_from_env(state: &impl DumpState) -> io::Result<bool> {
+    match std::env::var_os(STATE_ENV) {
+        Some(p) if !p.is_empty() => {
+            write_snapshot(state, Path::new(&p))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// A stateful snapshot writer: the ergonomic path for an app that emits a
+/// snapshot every render. Over its lifetime it
+///
+/// - stamps each snapshot it writes with a monotonic frame counter at
+///   `_meta.seq` (the first write is `1`), so a driver can tell a fresh frame
+///   from a stale file and can confirm a keypress produced a new frame
+///   (`panedrive`'s input-acknowledgement reads this), and
+/// - skips the write entirely when the state is unchanged from the last one it
+///   wrote, so a loop that redraws without a state change does not churn the
+///   file. `seq` therefore advances only on a real change.
+///
+/// The counter is per-writer and per-process: it restarts with the app, which is
+/// what a driver wants, since it clears the seam before spawning and compares
+/// within a single run. The `_meta` key is reserved for this stamp; turn it off
+/// with [`without_meta`](Self::without_meta) to emit the app's snapshot verbatim.
+#[derive(Debug)]
+pub struct SnapshotWriter {
+    path: PathBuf,
+    seq: u64,
+    last: Option<Value>,
+    meta: bool,
+}
+
+impl SnapshotWriter {
+    /// A writer targeting `path`, with the `_meta.seq` frame counter enabled.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            seq: 0,
+            last: None,
+            meta: true,
+        }
+    }
+
+    /// A writer targeting the path named by [`STATE_ENV`] (`PANEDRIVE_STATE`), or
+    /// `None` when that variable is unset or empty. An app can hold the
+    /// `Option<SnapshotWriter>` and write only when a driver is present.
+    pub fn from_env() -> Option<Self> {
+        match std::env::var_os(STATE_ENV) {
+            Some(p) if !p.is_empty() => Some(Self::new(PathBuf::from(p))),
+            _ => None,
+        }
+    }
+
+    /// Stop stamping `_meta.seq`, emitting the app's snapshot unchanged.
+    /// Skip-unchanged still applies. Chainable.
+    pub fn without_meta(mut self) -> Self {
+        self.meta = false;
+        self
+    }
+
+    /// How many snapshots this writer has written: the value most recently
+    /// stamped into `_meta.seq`, or `0` before the first write.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Write `state` if it changed since the last write. Returns `Ok(true)` when
+    /// a snapshot was written (the state differed, so `seq` advanced and the file
+    /// was replaced) or `Ok(false)` when the write was skipped as unchanged.
+    ///
+    /// Change is judged on the app's own snapshot, before the `_meta` stamp, so
+    /// the ever-advancing counter never counts as a change by itself.
+    pub fn write(&mut self, state: &impl DumpState) -> io::Result<bool> {
+        let snapshot = state.dump_state();
+        if self.last.as_ref() == Some(&snapshot) {
+            return Ok(false);
+        }
+        self.seq += 1;
+        write_value_atomic(&self.stamp(&snapshot), &self.path)?;
+        self.last = Some(snapshot);
+        Ok(true)
+    }
+
+    /// Stamp `_meta.seq` into an object snapshot when meta is on. A non-object
+    /// snapshot is returned unchanged: the seam contract requires an object root,
+    /// and [`check`] reports a non-object elsewhere, so this does not hide it.
+    fn stamp(&self, snapshot: &Value) -> Value {
+        match snapshot {
+            Value::Object(map) if self.meta => {
+                let mut map = map.clone();
+                let mut meta = serde_json::Map::new();
+                meta.insert("seq".to_string(), Value::Number(self.seq.into()));
+                map.insert("_meta".to_string(), Value::Object(meta));
+                Value::Object(map)
+            }
+            other => other.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +364,94 @@ pub fn check(root: &Value) -> Result<(), Vec<Violation>> {
             .into_iter()
             .map(|message| Violation { message })
             .collect())
+    }
+}
+
+/// Test helpers for an app that unit-tests its own seam snapshots.
+pub mod testing {
+    use serde_json::Value;
+
+    /// Assert that `actual` contains everything in `expected`: a deep, partial
+    /// match. Every key of an `expected` object must be present in `actual` with
+    /// a matching value, and every element of an `expected` array must match
+    /// `actual` at the same index, so `actual` may carry extra keys and extra
+    /// trailing elements. Scalars must be equal.
+    ///
+    /// This pins the few fields a test cares about without restating the whole
+    /// snapshot, so it does not break when an unrelated field, or the
+    /// [`SnapshotWriter`](crate::SnapshotWriter) `_meta` stamp, is added. On a
+    /// mismatch it panics with the dot-path and the two values, naming exactly
+    /// what differs and pointing the panic at the caller.
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// paneview::testing::assert_snapshot_contains(
+    ///     &json!({ "focus": "fleet", "rows": 3, "_meta": { "seq": 2 } }),
+    ///     &json!({ "focus": "fleet", "rows": 3 }),
+    /// );
+    /// ```
+    #[track_caller]
+    pub fn assert_snapshot_contains(actual: &Value, expected: &Value) {
+        if let Err(diff) = contains(actual, expected, "") {
+            panic!("snapshot mismatch at `{}`: {}", diff.path, diff.detail);
+        }
+    }
+
+    struct Diff {
+        path: String,
+        detail: String,
+    }
+
+    fn child(path: &str, seg: &str) -> String {
+        if path.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{path}.{seg}")
+        }
+    }
+
+    fn contains(actual: &Value, expected: &Value, path: &str) -> Result<(), Diff> {
+        match (actual, expected) {
+            (Value::Object(a), Value::Object(e)) => {
+                for (k, ev) in e {
+                    let here = child(path, k);
+                    match a.get(k) {
+                        Some(av) => contains(av, ev, &here)?,
+                        None => {
+                            return Err(Diff {
+                                path: here,
+                                detail: format!("missing key; expected {ev}"),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (Value::Array(a), Value::Array(e)) => {
+                for (i, ev) in e.iter().enumerate() {
+                    let here = child(path, &i.to_string());
+                    match a.get(i) {
+                        Some(av) => contains(av, ev, &here)?,
+                        None => {
+                            return Err(Diff {
+                                path: here,
+                                detail: format!("missing index; expected {ev}"),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (a, e) if a == e => Ok(()),
+            (a, e) => Err(Diff {
+                path: if path.is_empty() {
+                    "(root)".to_string()
+                } else {
+                    path.to_string()
+                },
+                detail: format!("expected {e}, got {a}"),
+            }),
+        }
     }
 }
 
@@ -405,5 +626,169 @@ mod tests {
         assert!(got.contains(&("rows.0.name".to_string(), "string")));
         assert!(got.contains(&("rows.1.name".to_string(), "string")));
         assert_eq!(got.len(), 5);
+    }
+
+    /// A snapshot source whose state we can change between writes.
+    struct Dyn(Value);
+    impl DumpState for Dyn {
+        fn dump_state(&self) -> Value {
+            self.0.clone()
+        }
+    }
+
+    fn writer_tmp(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "paneview-writer-{}-{}-{}",
+            tag,
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        (dir, path)
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn snapshot_writer_stamps_a_monotonic_seq() {
+        let (dir, path) = writer_tmp("seq");
+        let mut w = SnapshotWriter::new(&path);
+        assert_eq!(w.seq(), 0, "no frames before the first write");
+
+        assert!(w.write(&Dyn(json!({ "n": 1 }))).unwrap());
+        assert_eq!(w.seq(), 1);
+        assert_eq!(read_json(&path), json!({ "n": 1, "_meta": { "seq": 1 } }));
+
+        assert!(w.write(&Dyn(json!({ "n": 2 }))).unwrap());
+        assert_eq!(w.seq(), 2);
+        assert_eq!(read_json(&path)["_meta"]["seq"], json!(2));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_writer_skips_an_unchanged_write() {
+        let (dir, path) = writer_tmp("skip");
+        let mut w = SnapshotWriter::new(&path);
+
+        assert!(
+            w.write(&Dyn(json!({ "n": 1 }))).unwrap(),
+            "first write lands"
+        );
+        assert_eq!(w.seq(), 1);
+
+        // Same app state: the write is skipped and seq does not advance, so a
+        // redraw without a state change never counts as a new frame.
+        assert!(
+            !w.write(&Dyn(json!({ "n": 1 }))).unwrap(),
+            "an unchanged write is skipped"
+        );
+        assert_eq!(w.seq(), 1, "seq must not advance on a skipped write");
+        assert_eq!(read_json(&path)["_meta"]["seq"], json!(1));
+
+        // A real change writes again and advances seq.
+        assert!(w.write(&Dyn(json!({ "n": 2 }))).unwrap());
+        assert_eq!(w.seq(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_writer_without_meta_omits_the_stamp() {
+        let (dir, path) = writer_tmp("nometa");
+        let mut w = SnapshotWriter::new(&path).without_meta();
+        assert!(w.write(&Dyn(json!({ "n": 1 }))).unwrap());
+        let got = read_json(&path);
+        assert_eq!(got, json!({ "n": 1 }), "no _meta stamp when meta is off");
+        assert!(got.get("_meta").is_none());
+        // Skip-unchanged still applies with meta off.
+        assert!(!w.write(&Dyn(json!({ "n": 1 }))).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_writer_leaves_a_non_object_snapshot_unstamped() {
+        // A non-object root cannot carry a _meta key; it is written verbatim
+        // rather than silently wrapped, so `check` can still report it.
+        let (dir, path) = writer_tmp("nonobj");
+        let mut w = SnapshotWriter::new(&path);
+        assert!(w.write(&Dyn(json!([1, 2, 3]))).unwrap());
+        assert_eq!(read_json(&path), json!([1, 2, 3]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn env_snapshot_writes_when_set_and_noops_when_unset() {
+        // The only test that touches PANEDRIVE_STATE; it sets and then clears it
+        // within the one test so no other test races the shared variable.
+        let (dir, path) = writer_tmp("env");
+
+        unsafe { std::env::set_var(STATE_ENV, &path) };
+        assert!(
+            write_snapshot_from_env(&Dyn(json!({ "n": 1 }))).unwrap(),
+            "writes when the var is set"
+        );
+        assert_eq!(read_json(&path), json!({ "n": 1 }));
+        assert!(
+            SnapshotWriter::from_env().is_some(),
+            "from_env is Some when the var is set"
+        );
+
+        // Set but empty counts as absent: a no-op write and no writer, so an
+        // app cannot accidentally target the empty path.
+        unsafe { std::env::set_var(STATE_ENV, "") };
+        assert!(
+            !write_snapshot_from_env(&Dyn(json!({ "n": 9 }))).unwrap(),
+            "an empty var is a no-op, not a write to an empty path"
+        );
+        assert!(
+            SnapshotWriter::from_env().is_none(),
+            "from_env is None when the var is set but empty"
+        );
+
+        unsafe { std::env::remove_var(STATE_ENV) };
+        assert!(
+            !write_snapshot_from_env(&Dyn(json!({ "n": 2 }))).unwrap(),
+            "no-op when the var is unset"
+        );
+        assert!(
+            SnapshotWriter::from_env().is_none(),
+            "from_env is None when the var is unset"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assert_snapshot_contains_matches_a_subset() {
+        // Extra keys, extra trailing array elements, and the _meta stamp are all
+        // ignored; only the named fields must match.
+        testing::assert_snapshot_contains(
+            &json!({
+                "focus": "fleet",
+                "rows": [ { "status": "ok" }, { "status": "down" } ],
+                "extra": 9,
+                "_meta": { "seq": 3 },
+            }),
+            &json!({
+                "focus": "fleet",
+                "rows": [ { "status": "ok" } ],
+            }),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "focus")]
+    fn assert_snapshot_contains_panics_on_a_value_mismatch() {
+        testing::assert_snapshot_contains(&json!({ "focus": "fleet" }), &json!({ "focus": "bag" }));
+    }
+
+    #[test]
+    #[should_panic(expected = "missing")]
+    fn assert_snapshot_contains_panics_on_a_missing_key() {
+        testing::assert_snapshot_contains(&json!({ "focus": "fleet" }), &json!({ "rows": 1 }));
     }
 }

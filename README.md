@@ -94,6 +94,14 @@ impl DumpState for App {
 write_snapshot(&app, std::path::Path::new("run.state.json"))?;
 ```
 
+For an app that redraws in a loop, `paneview::SnapshotWriter::from_env()` is the
+ergonomic path: it targets `$PANEDRIVE_STATE` (so there is no path to hand-sync),
+skips the write when state is unchanged, and stamps a per-change frame counter at
+`_meta.seq` so a driver can tell a fresh frame from a stale file.
+`paneview::write_snapshot_from_env(&app)` is the one-line form without the
+counter, and `paneview::testing::assert_snapshot_contains` partial-matches a
+snapshot in your own unit tests.
+
 Not a Rust UI? The seam is just a JSON file, so any language can expose one by
 writing the same shape (atomically). See [`docs/SEAM.md`](docs/SEAM.md) for the
 one-page contract and Go/Python/JS adapters.

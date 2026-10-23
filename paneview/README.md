@@ -20,6 +20,33 @@ file (`paneview::write_snapshot`, atomic). The companion
 [`panedrive`](https://github.com/0xheartcode/panekit) crate drives your UI and
 asserts against exactly this JSON.
 
+## Emit on every render
+
+An app that redraws in a loop wants a writer it can call each frame without
+hand-syncing a path or churning the file. `SnapshotWriter` is that writer:
+
+```rust
+// Set up once. `from_env` targets $PANEDRIVE_STATE (the path panedrive reads),
+// and is `None` when the app is not under a driver, so production pays nothing.
+let mut seam = paneview::SnapshotWriter::from_env();
+
+// Each render:
+if let Some(w) = seam.as_mut() {
+    w.write(&app)?; // skipped when unchanged; stamps _meta.seq on a real change
+}
+```
+
+It does two things across its lifetime: it **skips the write when the state is
+unchanged**, so a redraw with no state change does not rewrite the file, and it
+stamps a monotonic frame counter at **`_meta.seq`** (first write is `1`) that
+advances only on a real change. A driver reads `_meta.seq` to tell a fresh frame
+from a stale file and to confirm a keypress actually produced a new frame.
+`without_meta()` turns the stamp off; `seq()` reads the counter.
+
+For a one-off (no counter, no skip), `paneview::write_snapshot_from_env(&app)`
+writes to `$PANEDRIVE_STATE` when set and is a no-op otherwise.
+`paneview::STATE_ENV` names the variable.
+
 ## Check your own snapshot
 
 You do not need the driver to test that your snapshot is well formed.
@@ -37,6 +64,10 @@ assert!(check(&app.dump_state()).is_ok(), "snapshot must satisfy the seam contra
 --paths` prints), and `try_dump_serialize` returns a serialization error as a
 `Result` instead of the `{"_error": "..."}` marker that `dump_serialize` writes
 on failure.
+
+To assert on just the fields a test cares about, `paneview::testing::assert_snapshot_contains(&actual, &expected)`
+is a partial match: it ignores extra keys, extra trailing array elements, and the
+`_meta` stamp, and panics with the dot-path of the first field that differs.
 
 ## Seam design: a few rules that keep it useful
 
