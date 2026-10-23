@@ -380,6 +380,14 @@ pub struct RunOptions {
     /// gap between a keypress and the UI writing its next snapshot, so a
     /// following `assert` does not race a stale seam. `None` disables settling.
     pub settle: Option<Duration>,
+    /// When `Some(timeout)`, each key/`type` step waits up to `timeout` for the
+    /// app to *acknowledge* the input by advancing `_meta.seq` (the `paneview`
+    /// `SnapshotWriter` frame counter), a precise alternative to [`settle`](Self::settle)'s
+    /// whole-seam change heuristic. When the seam carries no `_meta.seq` (an app
+    /// that does not stamp it, or a from-capture probe) it falls back to the same
+    /// change detection as settling, so it never hangs. Supersedes settling when
+    /// both are set. `None` disables it.
+    pub ack: Option<Duration>,
     /// When `Some(pattern)`, the run fails if the program's output ever contains
     /// `pattern` (e.g. `panicked`). Only a backend that retains the child's
     /// output stream (the PTY backend) can match; others never do.
@@ -405,6 +413,14 @@ impl RunOptions {
     /// Enable settling, waiting up to `timeout` after each mutating step.
     pub fn with_settle(mut self, timeout: Duration) -> Self {
         self.settle = Some(timeout);
+        self
+    }
+
+    /// Enable input-acknowledgement, waiting up to `timeout` after each mutating
+    /// step for the app to advance `_meta.seq` (falling back to change detection
+    /// when the seam has no counter). Supersedes [`with_settle`](Self::with_settle).
+    pub fn with_ack(mut self, timeout: Duration) -> Self {
+        self.ack = Some(timeout);
         self
     }
 
@@ -514,15 +530,20 @@ pub fn run_script(
     sink: &mut dyn RunSink,
 ) -> anyhow::Result<RunResult> {
     let settle = opts.settle.map(|d| scale_duration(d, opts.timeout_scale));
+    let ack = opts.ack.map(|d| scale_duration(d, opts.timeout_scale));
     let run_start = Instant::now();
     let t_ms = |start: Instant| start.elapsed().as_millis() as u64;
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         match step {
             Step::Press(keys) => {
-                let before = if settle.is_some() { sink.probe() } else { None };
+                let before = if settle.is_some() || ack.is_some() {
+                    sink.probe()
+                } else {
+                    None
+                };
                 backend.send_keys(keys)?;
-                settle_after(settle, &before, sink);
+                wait_after(settle, ack, &before, sink);
                 sink.on_event(&RunEvent {
                     t_ms: t_ms(run_start),
                     step: n,
@@ -539,14 +560,18 @@ pub fn run_script(
                         anyhow::anyhow!("step {n}: environment variable {var} is not set")
                     })?,
                 };
-                let before = if settle.is_some() { sink.probe() } else { None };
+                let before = if settle.is_some() || ack.is_some() {
+                    sink.probe()
+                } else {
+                    None
+                };
                 if *paste {
                     backend.paste_text(&text)?;
                 } else {
                     let keys: Vec<Key> = text.chars().map(Key::Char).collect();
                     backend.send_keys(&keys)?;
                 }
-                settle_after(settle, &before, sink);
+                wait_after(settle, ack, &before, sink);
                 // Never log the secret itself: record the source, not the value.
                 let detail = match source {
                     TypeSource::Literal(s) => s.clone(),
@@ -841,6 +866,23 @@ fn final_child_check(
     }
 }
 
+/// After a mutating step, wait for the UI to catch up before the next step.
+/// Input-ack supersedes settling: when `ack` is set, wait for the app to
+/// acknowledge the input; otherwise fall back to `settle`'s change detection.
+/// Both no-op when their option is `None`.
+fn wait_after(
+    settle: Option<Duration>,
+    ack: Option<Duration>,
+    before: &Option<Value>,
+    sink: &mut dyn RunSink,
+) {
+    if let Some(timeout) = ack {
+        ack_after(timeout, before, sink);
+    } else {
+        settle_after(settle, before, sink);
+    }
+}
+
 /// After a mutating step, poll the seam until it differs from `before` (or the
 /// settle timeout elapses). A no-op when `settle` is `None`.
 fn settle_after(settle: Option<Duration>, before: &Option<Value>, sink: &mut dyn RunSink) {
@@ -851,6 +893,33 @@ fn settle_after(settle: Option<Duration>, before: &Option<Value>, sink: &mut dyn
             return;
         }
         if start.elapsed() >= timeout {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(SETTLE_INTERVAL_MS));
+    }
+}
+
+/// The `_meta.seq` frame counter of a seam value, when the app stamps one.
+fn seq_of(v: &Value) -> Option<u64> {
+    v.get("_meta")?.get("seq")?.as_u64()
+}
+
+/// After a mutating step, poll the seam until the app acknowledges the input,
+/// or `timeout` elapses. Acknowledgement is `_meta.seq` advancing past the value
+/// in `before`; when neither `before` nor the seam carries `_meta.seq`, it falls
+/// back to any whole-seam change (the same signal [`settle_after`] uses), so a
+/// seam without the counter degrades gracefully instead of always waiting out
+/// the timeout.
+fn ack_after(timeout: Duration, before: &Option<Value>, sink: &mut dyn RunSink) {
+    let before_seq = before.as_ref().and_then(seq_of);
+    let start = Instant::now();
+    loop {
+        let current = sink.probe();
+        let acknowledged = match before_seq {
+            Some(b) => current.as_ref().and_then(seq_of).is_some_and(|c| c > b),
+            None => current.as_ref() != before.as_ref(),
+        };
+        if acknowledged || start.elapsed() >= timeout {
             return;
         }
         std::thread::sleep(Duration::from_millis(SETTLE_INTERVAL_MS));
@@ -1353,6 +1422,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, RunResult::Passed, "settle should absorb the async gap");
+    }
+
+    #[test]
+    fn ack_waits_for_the_frame_counter_to_advance() {
+        use std::cell::Cell;
+        // The app stamps _meta.seq. The pre-press snapshot is seq 5 / v 0, and so
+        // are the first few ack polls; only on the fourth read does the app
+        // produce a new frame (seq 6, v 1). With ack, the press waits for that
+        // new frame, so the following assert reads v=1; without it the assert
+        // races the stale v=0.
+        let make_probe = || {
+            let n = Cell::new(0);
+            move || {
+                let i = n.get();
+                n.set(i + 1);
+                let fresh = i >= 3;
+                Some(json!({
+                    "v": if fresh { 1 } else { 0 },
+                    "_meta": { "seq": if fresh { 6 } else { 5 } },
+                }))
+            }
+        };
+        let steps = parse_script("press a\nassert v=1").unwrap();
+
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_ack(Duration::from_secs(1)),
+            &mut probe_sink(make_probe()),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed, "ack should wait for the new frame");
+    }
+
+    #[test]
+    fn ack_keys_on_seq_not_any_value_change() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        // v changes on EVERY poll, but _meta.seq holds at 5 until the fourth read.
+        // A correct ack keys on the counter and ignores the churning v, so it
+        // polls until seq advances (4 polls); an ack that returned on any change
+        // would stop at the first poll. The poll count tells the two apart.
+        let polls = Rc::new(Cell::new(0u32));
+        let p = Rc::clone(&polls);
+        let before = Some(json!({ "v": 0, "_meta": { "seq": 5 } }));
+        let mut sink = probe_sink(move || {
+            let i = p.get();
+            p.set(i + 1);
+            let seq = if i >= 3 { 6 } else { 5 };
+            Some(json!({ "v": i + 1, "_meta": { "seq": seq } }))
+        });
+        ack_after(Duration::from_secs(1), &before, &mut sink);
+        assert_eq!(
+            polls.get(),
+            4,
+            "ack must wait for _meta.seq to advance, not the first v change"
+        );
+    }
+
+    #[test]
+    fn ack_falls_back_to_change_detection_without_a_counter() {
+        use std::cell::Cell;
+        // An app that does not stamp _meta.seq: ack cannot compare counters, so it
+        // falls back to any whole-seam change, the same signal settle uses, rather
+        // than waiting out the timeout. The seam flips on the third read.
+        let polls = std::rc::Rc::new(Cell::new(0u32));
+        let p = std::rc::Rc::clone(&polls);
+        let before = Some(json!({ "v": 0 }));
+        let mut sink = probe_sink(move || {
+            let i = p.get();
+            p.set(i + 1);
+            Some(json!({ "v": if i >= 2 { 1 } else { 0 } }))
+        });
+        ack_after(Duration::from_secs(1), &before, &mut sink);
+        assert_eq!(polls.get(), 3, "fallback should return on the first change");
+    }
+
+    #[test]
+    fn settle_also_waits_after_a_type_step() {
+        use std::cell::Cell;
+        // The same async gap applies to `type` as to `press`, so settle must
+        // capture the pre-step snapshot and wait for a `type` too, not only a
+        // `press`. The seam flips to v=1 on the fourth read.
+        let make_probe = || {
+            let n = Cell::new(0);
+            move || {
+                let i = n.get();
+                n.set(i + 1);
+                Some(json!({ "v": if i < 3 { 0 } else { 1 } }))
+            }
+        };
+        let steps = parse_script("type x\nassert v=1").unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_settle(Duration::from_secs(1)),
+            &mut probe_sink(make_probe()),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed, "settle must also wait after a type");
+    }
+
+    #[test]
+    fn ack_also_waits_after_a_type_step() {
+        use std::cell::Cell;
+        // Likewise ack must capture the pre-step snapshot and wait for `_meta.seq`
+        // to advance after a `type`, not only a `press`.
+        let make_probe = || {
+            let n = Cell::new(0);
+            move || {
+                let i = n.get();
+                n.set(i + 1);
+                let fresh = i >= 3;
+                Some(json!({
+                    "v": if fresh { 1 } else { 0 },
+                    "_meta": { "seq": if fresh { 6 } else { 5 } },
+                }))
+            }
+        };
+        let steps = parse_script("type x\nassert v=1").unwrap();
+        let out = run_script(
+            &steps,
+            &mock(),
+            &RunOptions::new().with_ack(Duration::from_secs(1)),
+            &mut probe_sink(make_probe()),
+        )
+        .unwrap();
+        assert_eq!(out, RunResult::Passed, "ack must also wait after a type");
     }
 
     #[test]

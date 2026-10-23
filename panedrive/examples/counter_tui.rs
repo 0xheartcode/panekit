@@ -11,7 +11,7 @@
 //!
 //! Commands (one per line): `inc`, `dec`, `quit`.
 
-use paneview::{DumpState, write_snapshot};
+use paneview::{DumpState, SnapshotWriter};
 use serde_json::{Value, json};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -39,7 +39,10 @@ fn main() {
         last: "start".to_string(),
         ready: true,
     };
-    write_snapshot(&c, &path).expect("write initial snapshot");
+    // A stateful writer stamps `_meta.seq` on each change, so a driver can use
+    // `panedrive run --ack` to wait for the app to acknowledge a keypress.
+    let mut writer = SnapshotWriter::new(path);
+    writer.write(&c).expect("write initial snapshot");
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -56,6 +59,6 @@ fn main() {
             "quit" => break,
             other => c.last = format!("unknown:{other}"),
         }
-        write_snapshot(&c, &path).expect("write snapshot");
+        writer.write(&c).expect("write snapshot");
     }
 }

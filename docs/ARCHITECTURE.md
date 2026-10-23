@@ -113,3 +113,23 @@ determinism with one shared driver.
 - The seam contract check lives in `paneview` (`paneview::check` / `leaves`), the
   crate that defines the seam, so the rule has one owner. `panedrive`'s
   `validate-seam` and `state --paths` reuse it rather than re-implementing it.
+- Input-acknowledgement (`run --ack`): instead of `--settle`'s heuristic (wait
+  for any seam change after a key), wait for the app to advance `_meta.seq`, the
+  monotonic frame counter the `paneview` `SnapshotWriter` stamps only on a real
+  state change. This confirms the app consumed the input and produced a new
+  frame, not that the seam happened to differ. It falls back to change detection
+  when the seam carries no `_meta.seq`, so an uninstrumented app still works. The
+  counter is the shared mechanism; the driver reads it through the same seam.
+- Inline scripts (`run -e <step>`): the `run` grammar is fed from repeatable
+  `-e` lines as readily as from a file, for a one-off or a generated flow. Same
+  parser, same steps; a path and `-e` are mutually exclusive.
+- Post-exit screen retention (pty backend): a quitting TUI restores the blank
+  primary screen, so the owned child's last rendered frame would be lost. The
+  backend retains the last non-blank frame and serves it to `capture` /
+  `expect-screen` once the child has exited, the screen-side complement to the
+  read-only-after-clean-exit seam rule, so a quit flow can assert its final
+  screen as well as its final seam.
+- Relocatable failure bundle: the `--artifacts` manifest references its members
+  by bare basename, not the absolute path they were written at, so the bundle
+  survives being uploaded as a CI artifact and downloaded elsewhere. The live run
+  summary keeps full paths for the operator on the machine that ran.

@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Entries are kept on a single line each: cargo-dist injects this file into the GitHub Release body, where GitHub renders every newline as a hard break, so wrapped lines would show as ragged mid-sentence breaks.
 
+## [panedrive 0.1.6] - 2026-10-22
+
+Ships `panedrive` only. Theme: CI robustness and honest input timing. Additive and backward compatible. Reuses `paneview` 0.1.4 for the `_meta.seq` frame counter.
+
+### Added
+
+- **`run --ack`**: after each key/`type` step, wait up to ~1s for the app to acknowledge the input by advancing `_meta.seq` (the `paneview` `SnapshotWriter` frame counter), a precise alternative to `--settle`'s whole-seam change heuristic. When the seam carries no `_meta.seq` (an app that does not stamp it, or `--from-capture`) it falls back to the same change detection as `--settle`, so it never hangs. Not combined with `--settle`.
+- **`run -e <step>` (inline script)**: pass script steps directly on the command line, repeatable, instead of a script file, e.g. `run -e "press Enter" -e "assert ready=true"`. Each `-e` is one line fed to the same parser. A script path and `-e` are mutually exclusive, and one of the two is required.
+
+### Changed
+
+- **Post-exit screen capture (pty backend)**: a `capture` or `expect-screen` after a clean exit now returns the app's last rendered frame instead of the blank primary screen a quitting TUI restores. The backend retains the last non-blank frame and serves it once the child has exited; while the child runs, `capture` is unchanged. This is the screen-side complement to the 0.1.5 read-only-after-exit rule.
+- **Relocatable failure bundle**: the `--artifacts` `manifest.json` now references its members (`screen.txt`, `seam.json`, `events.jsonl`) by bare basename instead of the absolute path they were written at, so the bundle can be uploaded as a CI artifact and inspected after it is downloaded on another machine. The run summary's `artifacts` object keeps full paths for the operator on the machine that ran.
+- panedrive now depends on paneview 0.1.4.
+
 ## [paneview 0.1.4] - 2026-10-22
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.

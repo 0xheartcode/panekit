@@ -156,7 +156,13 @@ panedrive run login.pds --backend tmux --pane mysession:1.0 --state run.state.js
 
 # or spawn the program yourself in a PTY (no multiplexer, ideal for CI)
 panedrive run login.pds --backend pty --state run.state.json -- ./my-tui --flag
+
+# or pass the steps inline with -e (repeatable) instead of a file
+panedrive run -e "type inc" -e "press Enter" -e "wait-until count=1" \
+  --backend pty --state run.state.json -- ./my-tui
 ```
+
+A script path and `-e` are mutually exclusive, and one of the two is required.
 
 Steps: `press <keys>`, `type <text>` (also `type --from-env VAR` and
 `type --paste ...` for secrets, see below), `wait-until <cond> [--timeout-ms N]
@@ -178,7 +184,10 @@ unexpectedly, before the script ends or with a non-zero status, so a crash after
 the last assertion is no longer a false pass. A non-zero exit always fails. A
 clean exit (code 0) fails only if a later step would still send input to the
 program; a clean quit followed only by read-only steps is fine, so a script that
-quits the app and then asserts its final saved state passes. Pass `--allow-exit`
+quits the app and then asserts its final saved state passes. A `capture` or
+`expect-screen` after a clean exit reads the app's last rendered frame, not the
+blank screen a quitting TUI restores, so the final *screen* is assertable too,
+not just the final seam. Pass `--allow-exit`
 for a script that deliberately quits the program. `run --fail-on <substring>`
 fails the run if the program's output ever contains that literal substring (e.g.
 `panicked`), a continuous guard over the output stream distinct from
@@ -202,7 +211,12 @@ After a key that *changes* state, `wait-until` the new state rather than
 `assert` right after a `press` can read the pre-change seam. Use `assert` for
 state that has already settled. Or pass **`--settle`** to `run`, and every
 key/type step waits (up to ~1s) for the seam to change before the next step, so
-you can `assert` right after a `press` without the race.
+you can `assert` right after a `press` without the race. For a precise wait, pass
+**`--ack`** instead: each key/type step waits for the app to acknowledge the
+input by advancing `_meta.seq` (the `paneview` snapshot writer's frame counter)
+rather than guessing from any seam change, and it falls back to `--settle`'s
+change detection when the seam carries no `_meta.seq`. Pass one of `--settle` or
+`--ack`, not both.
 
 No seam to read? **`run --from-capture`** evaluates conditions against the
 captured screen text instead of a state file (`screen` is the whole screen,

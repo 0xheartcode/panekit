@@ -174,8 +174,13 @@ enum Cmd {
 /// Arguments to the `run` subcommand.
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Path to the script file (one step per line; `#` comments allowed).
-    script: PathBuf,
+    /// Path to the script file (one step per line; `#` comments allowed). Omit it
+    /// when passing steps inline with `-e`.
+    script: Option<PathBuf>,
+    /// Inline script step, repeatable: `-e "press Enter" -e "assert ready=true"`.
+    /// Each `-e` is one script line. Mutually exclusive with the script path.
+    #[arg(short = 'e', long = "inline", value_name = "STEP")]
+    inline: Vec<String>,
     #[arg(long, value_enum, default_value_t = Backend::Tmux)]
     backend: Backend,
     /// State seam path that `assert` / `wait-until` steps read (defaults to
@@ -198,6 +203,13 @@ struct RunArgs {
     /// before the next step, so an `assert` does not race a stale snapshot.
     #[arg(long)]
     settle: bool,
+    /// After each key/type step, wait up to ~1s for the app to acknowledge the
+    /// input by advancing `_meta.seq` (the paneview SnapshotWriter frame
+    /// counter), a precise alternative to `--settle`. Falls back to `--settle`'s
+    /// change detection when the seam has no `_meta.seq`. Not combined with
+    /// `--settle`.
+    #[arg(long)]
+    ack: bool,
     /// Evaluate conditions against the captured screen text (`screen`,
     /// `lines.<n>`) instead of a JSON state file, for apps with no seam.
     #[arg(long)]
@@ -517,6 +529,7 @@ fn cmd_watch(
 fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let RunArgs {
         script,
+        inline,
         backend,
         state,
         pane,
@@ -524,6 +537,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         rows,
         cols,
         settle,
+        ack,
         from_capture,
         json,
         events,
@@ -558,9 +572,26 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
             anyhow::bail!("--timeout-scale must be a positive number");
         }
     }
+    // Both wait after each mutating step; running both is redundant and their
+    // precedence would be surprising, so take exactly one.
+    if settle && ack {
+        anyhow::bail!("--settle and --ack both wait after each step; pass only one");
+    }
+    // Exactly one source of steps: a script-file path, or one or more inline `-e`
+    // lines. Both is ambiguous; neither leaves nothing to run. Either way the
+    // text is fed to the same parser, so inline needs no separate grammar.
+    let text = match (&script, inline.is_empty()) {
+        (Some(_), false) => {
+            anyhow::bail!("pass a script path or inline steps with -e, not both");
+        }
+        (None, true) => {
+            anyhow::bail!("no script: pass a script path or at least one -e <step>");
+        }
+        (Some(path), true) => std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading script {}: {e}", path.display()))?,
+        (None, false) => inline.join("\n"),
+    };
     let is_pty = matches!(backend, Backend::Pty);
-    let text = std::fs::read_to_string(&script)
-        .map_err(|e| anyhow::anyhow!("reading script {}: {e}", script.display()))?;
     let steps = parse_script(&text)?;
     // The pty backend records the cast via an output tap; tmux records via a
     // pipe-pane recorder. Route the one cast path to whichever the backend can
@@ -574,6 +605,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let mut tmux_recorder = start_tmux_cast(pane.clone(), tmux_cast)?;
     let opts = RunOptions {
         settle: settle.then(|| Duration::from_millis(1000)),
+        ack: ack.then(|| Duration::from_millis(1000)),
         fail_on,
         allow_exit,
         timeout_scale,

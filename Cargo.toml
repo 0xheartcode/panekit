@@ -13,7 +13,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # internal
-paneview = { path = "paneview", version = "0.1.3" }
+paneview = { path = "paneview", version = "0.1.4" }
 
 # external
 serde = { version = "1", features = ["derive"] }
