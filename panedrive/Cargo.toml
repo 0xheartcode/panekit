@@ -6,7 +6,7 @@ categories = ["development-tools::testing", "command-line-utilities"]
 readme = "README.md"
 # Decoupled from the workspace version: panedrive and paneview are versioned and
 # released independently. panedrive ships 0.1.7 (suite runner and richer
-# assertions) and depends on paneview 0.1.4 (the seam contract check it reuses,
+# assertions) and depends on paneview 0.1.5 (the seam contract check it reuses,
 # plus the _meta.seq frame counter input-ack reads); see [workspace.dependencies]
 # in the root Cargo.toml.
 version = "0.1.7"

@@ -32,6 +32,14 @@ Ships `panedrive` only. Theme: a suite runner (matrix and parameter sweep) and r
 - **`capture --ansi`**: capture the pane's visible text with colour and text attributes preserved as an ANSI escape stream, instead of flattening to plain text, so you can inspect styling a plain capture drops (pty backend; other backends fall back to plain text).
 - **`expect-golden <file>` step and `run --update-goldens`**: assert the rendered screen against a stored golden file, or record/refresh goldens by running with `--update-goldens` (or `PANEDRIVE_UPDATE_GOLDENS=1`). A missing golden fails with a message telling you to record it. Goldens are normalized (trailing whitespace and trailing blank lines trimmed) so they stay stable against a backend's cell padding and the pane height.
 
+## [paneview 0.1.5] - 2026-10-22
+
+Ships `paneview` only. `panedrive` is unchanged. Additive and backward compatible.
+
+### Added
+
+- **`SnapshotWriter::compact()`**: write compact single-line JSON instead of the default indented form, so an app that snapshots on every render serializes, writes, and reads fewer bytes per frame. The seam content is identical; `write_snapshot` and the default writer stay pretty for readability.
+
 ## [paneview 0.1.4] - 2026-10-23
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.

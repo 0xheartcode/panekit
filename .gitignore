@@ -9,6 +9,10 @@ Cargo.lock.orig
 *.state.json
 *.state.json.tmp
 
+# python bytecode cache (adapters/python)
+__pycache__/
+*.pyc
+
 # misc
 .DS_Store
 *.log
