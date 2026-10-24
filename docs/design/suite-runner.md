@@ -24,13 +24,16 @@ axes means one cell, emitted exactly as before.
 
 Axes come from two sources, which compose into one product:
 
-- **Matrix, from script headers.** Leading `#` comment lines in the `.pds`
+- **Matrix, from script directives.** `#@` directive comments in the `.pds`
   script declare axes, so a suite travels with its script:
-  - `# size: 24x80, 40x120` gives a `size` axis of two terminal dimensions.
-  - `# env: THEME=light, THEME=dark` gives an `env` axis of child environment
+  - `#@size: 24x80, 40x120` gives a `size` axis of two terminal dimensions
+    (`rows x cols`).
+  - `#@env: THEME=light, THEME=dark` gives an `env` axis of child environment
     bindings.
-  (Header comments are parsed from the raw script text, since the step parser
-  drops `#` lines. Only these two keys are recognised in 0.1.7.)
+  (Directives are parsed from the raw script text, since the step parser drops
+  `#` lines. The `@` marker is required: a plain `# size:` comment is left inert,
+  so adding the suite runner never changes the meaning of an existing script.
+  Only these two keys are recognised in 0.1.7.)
 - **Sweep, from the CLI.** `--sweep VAR=1..8` (an inclusive integer range) or
   `--sweep VAR=a,b,c` (an explicit list) adds a `VAR` axis whose value is passed
   to the child as the environment variable `VAR`.
@@ -93,11 +96,18 @@ single-run contract.
 ## Constraints and gates
 
 - **pty only.** Matrix and sweep need to own the child and set its environment
-  and size, which only the PTY backend does. `--sweep`, a `# size:`/`# env:`
-  header, and `--jobs > 1` are usage errors on the attach backends.
-- **single-destination flags.** `--cast` and `--events` write one file and
-  cannot represent many cells, so they are rejected alongside a multi-cell run
-  (as `--retry-timeouts` already rejects `--cast`).
+  and size, which only the PTY backend does. `--sweep`, a `#@size:`/`#@env:`
+  directive, and `--jobs > 1` are usage errors on the attach backends.
+- **per-cell artifacts.** `--artifacts <dir>` extends to a suite: each failing
+  cell writes its own bundle under `<dir>/<NNN-id>/` (the cell index, then its
+  sanitized axis bindings), and the cell's NDJSON envelope carries an `artifacts`
+  pointer, exactly as a single run's summary does. A passing cell writes nothing.
+- **single-destination flags.** `--cast`, `--events`, and `--retry-timeouts`
+  each write or assume one destination/attempt and are rejected alongside a
+  suite. (Because they are rejected, a plain single run that passes them must
+  *not* be misread as a suite: that is why the matrix trigger is the explicit
+  `#@` marker, not a bare `# size:` comment a script may already carry for
+  another tool.)
 - **`--jobs` requires a multi-cell run** (an axis or a sweep); `--jobs` with a
   single cell is a usage error, not a silent no-op.
 

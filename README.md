@@ -227,6 +227,39 @@ captured screen text instead of a state file (`screen` is the whole screen,
 `lines.<n>` each row), so `wait-until "screen~=Ready" --from-capture` drives an
 uninstrumented app. Less precise than a real seam, but it degrades gracefully.
 
+### Matrix and sweep (running a script many times)
+
+Run one script across many configurations instead of hand-rolling a shell loop.
+A **matrix** is declared with `#@` directives in the script (sizes are
+`rows x cols`). The `@` marker keeps them distinct from ordinary `#` comments, so
+a plain `# size:` note a script may already carry is never treated as an axis:
+
+```text
+#@size: 24x80, 40x120
+#@env: THEME=light, THEME=dark
+wait-until ready=true
+```
+
+`run` expands it across the cartesian product (here four cells: two sizes times
+two themes), running each with that terminal size and child environment. A
+**parameter sweep** comes from the CLI instead:
+
+```bash
+# run the script once per seed, four at a time, one JSON line per run
+panedrive run flow.pds --backend pty --sweep SEED=1..100 --jobs 4 --json -- ./my-tui
+```
+
+The sweep value is set as the child environment variable (`SEED`), and each cell
+gets its own isolated seam (its own `$PANEDRIVE_STATE` path), so `--jobs` runs
+them in parallel safely. Under `--json` a multi-cell run emits NDJSON: one
+self-contained result envelope per line (the single-run shape plus an `id` of the
+cell's bindings), written as each cell finishes, so it streams and is trivial to
+parse. The process exits `0` only if every cell passed. `--artifacts <dir>` works
+with a suite too: each failing cell writes its bundle under `<dir>/<NNN-id>/` and
+its envelope points at it. Suites run on the pty backend (they own and configure
+a child per cell), and `--cast`, `--events`, and `--retry-timeouts` are not
+combined with one. See [`docs/design/suite-runner.md`](docs/design/suite-runner.md).
+
 ### Conditions
 
 `wait-until` / `assert` take a tiny expression over the state JSON:

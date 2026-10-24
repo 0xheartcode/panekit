@@ -23,6 +23,7 @@ pub mod key;
 pub mod record;
 pub mod script;
 pub mod seam;
+pub mod suite;
 
 pub use artifacts::{ArtifactPaths, write_bundle};
 #[cfg(feature = "pty")]
@@ -40,3 +41,4 @@ pub use script::{
     ClosureSink, FailReason, RunEvent, RunOptions, RunResult, RunSink, Step, StepFailure,
     TypeSource, parse_script, probe_sink, run_script, run_with_retries,
 };
+pub use suite::{CellSpec, SuiteAxes, build_cells, parse_suite_header, parse_sweep};

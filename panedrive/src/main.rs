@@ -12,7 +12,7 @@
 //! shell gates and in CI.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -36,6 +36,10 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// `Run` carries the large `RunArgs`; the others are small. This enum is built
+// once per process from argv, so the size difference does not matter, and clap's
+// derive cannot flatten a boxed `Args` variant.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Send keys to a pane, e.g. `2 Down Down Enter` or `C-c`. Accepts the keys
     /// as one quoted spec ("2 Down Enter") or as separate args (2 Down Enter).
@@ -258,6 +262,15 @@ struct RunArgs {
     /// `expect-golden` step writes the current screen to its file and passes.
     #[arg(long, env = "PANEDRIVE_UPDATE_GOLDENS")]
     update_goldens: bool,
+    /// Run the script once per value of a variable (a parameter sweep):
+    /// `--sweep SEED=1..8` or `--sweep MODE=a,b,c`. The value is set as a child
+    /// environment variable. Emits one JSON result line per run. pty backend.
+    #[arg(long, value_name = "VAR=RANGE")]
+    sweep: Option<String>,
+    /// Run up to N cells of a suite (matrix or sweep) in parallel. Requires a
+    /// multi-cell run. Defaults to 1 (sequential).
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    jobs: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -566,6 +579,8 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         retry_timeouts,
         artifacts,
         update_goldens,
+        sweep,
+        jobs,
     } = args;
     if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
         anyhow::bail!("--cast is supported on the pty and tmux backends only");
@@ -612,6 +627,52 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     };
     let is_pty = matches!(backend, Backend::Pty);
     let steps = parse_script(&text)?;
+
+    // A run is a *suite* when the script declares a `#@size:`/`#@env:` directive or
+    // a `--sweep` is given: the script runs once per cell (the cartesian product
+    // of the axes). This is a separate path; a plain single run falls through to
+    // the existing machinery below untouched.
+    let axes = panedrive::parse_suite_header(&text)?;
+    let sweep_axis = match &sweep {
+        Some(spec) => Some(panedrive::parse_sweep(spec)?),
+        None => None,
+    };
+    let is_suite = !axes.is_empty() || sweep_axis.is_some();
+    if jobs == 0 {
+        anyhow::bail!("--jobs must be at least 1");
+    }
+    if is_suite {
+        return run_suite(SuiteRun {
+            steps: &steps,
+            opts: RunOptions {
+                settle: settle.then(|| Duration::from_millis(1000)),
+                ack: ack.then(|| Duration::from_millis(1000)),
+                fail_on,
+                allow_exit,
+                timeout_scale,
+                update_goldens,
+            },
+            backend,
+            program,
+            base_rows: rows,
+            base_cols: cols,
+            state: state.clone(),
+            from_capture,
+            json,
+            jobs,
+            axes,
+            sweep_axis,
+            cast: cast.is_some(),
+            events: events.is_some(),
+            artifacts: artifacts.clone(),
+            retry_timeouts,
+        });
+    }
+    if jobs > 1 {
+        anyhow::bail!(
+            "--jobs is only meaningful for a suite (pass --sweep or a `#@size:`/`#@env:` directive)"
+        );
+    }
     // The pty backend records the cast via an output tap; tmux records via a
     // pipe-pane recorder. Route the one cast path to whichever the backend can
     // stream from.
@@ -656,6 +717,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
             program.clone(),
             rows,
             cols,
+            &[],
             pty_cast.clone(),
         )?;
         let b: &dyn PaneBackend = backend_box.as_ref();
@@ -762,6 +824,355 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// The inputs to a suite run (a matrix and/or parameter sweep), collected so
+/// `cmd_run` can hand off without a long argument list.
+struct SuiteRun<'a> {
+    steps: &'a [panedrive::Step],
+    opts: RunOptions,
+    backend: Backend,
+    program: Vec<String>,
+    base_rows: u16,
+    base_cols: u16,
+    state: Option<PathBuf>,
+    from_capture: bool,
+    json: bool,
+    jobs: usize,
+    axes: panedrive::SuiteAxes,
+    sweep_axis: Option<(String, Vec<String>)>,
+    cast: bool,
+    events: bool,
+    artifacts: Option<PathBuf>,
+    retry_timeouts: u32,
+}
+
+/// One cell's result, ready to emit: the pass flag, the NDJSON line, and a human
+/// one-liner.
+struct CellReport {
+    ok: bool,
+    line: String,
+    human: String,
+}
+
+/// Run a suite: expand the axes into cells, run the script once per cell with a
+/// fresh backend and an isolated seam, and emit one result line per cell.
+fn run_suite(run: SuiteRun) -> anyhow::Result<ExitCode> {
+    let SuiteRun {
+        steps,
+        opts,
+        backend,
+        program,
+        base_rows,
+        base_cols,
+        state: _state,
+        from_capture,
+        json,
+        jobs,
+        axes,
+        sweep_axis,
+        cast,
+        events,
+        artifacts,
+        retry_timeouts,
+    } = run;
+
+    // A suite sets each cell's terminal size and child environment and owns a
+    // child per cell, which only the pty backend does.
+    if !matches!(backend, Backend::Pty) {
+        anyhow::bail!(
+            "a suite (--sweep or a `#@size:`/`#@env:` directive) runs on the pty backend only"
+        );
+    }
+    // These each write a single destination and cannot represent many cells.
+    if cast {
+        anyhow::bail!("--cast writes one recording and cannot be combined with a suite");
+    }
+    if events {
+        anyhow::bail!("--events writes one file and cannot be combined with a suite");
+    }
+    if retry_timeouts > 0 {
+        anyhow::bail!("--retry-timeouts cannot be combined with a suite");
+    }
+    // Unlike the single-destination flags above, `--artifacts` extends cleanly to
+    // a suite: each failing cell writes its own bundle under `<dir>/<NNN-id>/`, so
+    // the directory holds one subdirectory per failure.
+    let artifacts = artifacts.as_deref();
+
+    let cells = panedrive::build_cells(&axes, sweep_axis.as_ref(), base_rows, base_cols);
+    let total = cells.len();
+
+    // Shared across workers: the next cell to claim, the pass/fail tally, and a
+    // lock that serializes each complete output line so lines never interleave.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let passed = std::sync::atomic::AtomicUsize::new(0);
+    let emit = std::sync::Mutex::new(());
+
+    let emit_report = |r: &CellReport| {
+        if r.ok {
+            passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _g = emit.lock().unwrap_or_else(|e| e.into_inner());
+        if json {
+            println!("{}", r.line);
+        } else {
+            eprintln!("{}", r.human);
+        }
+    };
+
+    let ctx = CellCtx {
+        steps,
+        opts: &opts,
+        backend,
+        program: &program,
+        from_capture,
+        artifacts,
+    };
+
+    if jobs <= 1 {
+        for (i, cell) in cells.iter().enumerate() {
+            let report = run_cell(i, cell, &ctx);
+            emit_report(&report);
+        }
+    } else {
+        let workers = jobs.min(total).max(1);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= total {
+                            break;
+                        }
+                        let report = run_cell(i, &cells[i], &ctx);
+                        emit_report(&report);
+                    }
+                });
+            }
+        });
+    }
+
+    let passed = passed.load(std::sync::atomic::Ordering::Relaxed);
+    if !json {
+        eprintln!("suite: {passed}/{total} cells passed");
+    }
+    if passed == total {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+/// The per-run inputs every cell shares (only `index` and the cell itself vary),
+/// grouped so `run_cell` takes a short argument list and the parallel workers can
+/// hand each cell one reference.
+struct CellCtx<'a> {
+    steps: &'a [panedrive::Step],
+    opts: &'a RunOptions,
+    backend: Backend,
+    program: &'a [String],
+    from_capture: bool,
+    /// When set, a failing cell writes its bundle under `<artifacts>/<NNN-id>/`.
+    artifacts: Option<&'a Path>,
+}
+
+/// Run one cell: spawn a fresh backend with the cell's size and environment and
+/// an isolated per-cell seam, run the script, and build the result line. A spawn
+/// or run error becomes a failed report rather than aborting the whole suite.
+/// When `ctx.artifacts` is set and the cell fails, its failure bundle is written
+/// under `<artifacts>/<NNN-id>/` and pointed at from the cell's envelope.
+fn run_cell(index: usize, cell: &panedrive::CellSpec, ctx: &CellCtx) -> CellReport {
+    let steps = ctx.steps;
+    let opts = ctx.opts;
+    let backend = ctx.backend;
+    let program = ctx.program;
+    let from_capture = ctx.from_capture;
+    let artifacts_dir = ctx.artifacts;
+    // A unique seam path per cell, so parallel cells never read, write, or clear
+    // each other's snapshot. The child is pointed at it via PANEDRIVE_STATE.
+    let seam = std::env::temp_dir().join(format!(
+        "panedrive-cell-{}-{}.state.json",
+        std::process::id(),
+        index
+    ));
+    let mut env = cell.env.clone();
+    if !from_capture {
+        let _ = std::fs::remove_file(&seam);
+        env.push((
+            "PANEDRIVE_STATE".to_string(),
+            seam.to_string_lossy().into_owned(),
+        ));
+    }
+
+    let backend_box = match run_backend(
+        backend,
+        None,
+        program.to_vec(),
+        cell.rows,
+        cell.cols,
+        &env,
+        None,
+    ) {
+        Ok(b) => b,
+        Err(e) => return CellReport::error(cell, &e.to_string()),
+    };
+    let b: &dyn PaneBackend = backend_box.as_ref();
+    let mut collected: Vec<RunEvent> = Vec::new();
+    let seam_probe = seam.clone();
+    let mut probe: Box<dyn FnMut() -> Option<Value>> = if from_capture {
+        Box::new(|| b.capture().ok().map(|text| driver::screen_state(&text)))
+    } else {
+        Box::new(move || driver::read_state_file(&seam_probe))
+    };
+    let outcome = {
+        let mut sink = ClosureSink::new(
+            &mut probe,
+            |_screen: &str| {},
+            |e: &RunEvent| collected.push(e.clone()),
+        );
+        match run_script(steps, b, opts, &mut sink) {
+            Ok(o) => o,
+            Err(e) => {
+                if !from_capture {
+                    let _ = std::fs::remove_file(&seam);
+                }
+                return CellReport::error(cell, &e.to_string());
+            }
+        }
+    };
+    // On failure, write this cell's bundle under `<dir>/<NNN-id>/`, capturing the
+    // final screen and seam *before* the seam file below is removed.
+    let artifacts_json = match (artifacts_dir, &outcome) {
+        (Some(dir), RunResult::Failed(failure)) => {
+            let screen = b.capture().ok();
+            let last_seam = if from_capture {
+                screen.as_deref().map(driver::screen_state)
+            } else {
+                driver::read_state_file(&seam)
+            };
+            let cell_dir = dir.join(cell_slug(index, cell));
+            panedrive::write_bundle(
+                &cell_dir,
+                screen.as_deref(),
+                last_seam.as_ref(),
+                &collected,
+                &failure.to_json(),
+            )
+            .ok()
+            .map(|ap| ap.to_json())
+        }
+        _ => None,
+    };
+    if !from_capture {
+        let _ = std::fs::remove_file(&seam);
+    }
+    // `backend_box` drops here at end of scope (after `probe`), killing the
+    // child; declaration order makes that drop order correct, so no manual drop.
+    CellReport::from_outcome(cell, &outcome, &collected, artifacts_json)
+}
+
+/// A filesystem-safe subdirectory name for a cell's artifact bundle: the cell
+/// index (so bundles sort in run order and never collide) then the cell's axis
+/// bindings, with any character outside `[A-Za-z0-9._-]` replaced by `_`.
+fn cell_slug(index: usize, cell: &panedrive::CellSpec) -> String {
+    let safe: String = cell
+        .id
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("_")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        format!("{index:03}")
+    } else {
+        format!("{index:03}-{safe}")
+    }
+}
+
+impl CellReport {
+    /// The axis bindings of a cell as a JSON object (the `id` field).
+    fn id_object(cell: &panedrive::CellSpec) -> Value {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &cell.id {
+            m.insert(k.clone(), Value::String(v.clone()));
+        }
+        Value::Object(m)
+    }
+
+    /// A human label for a cell, e.g. `size=24x80 SEED=1`, or `cell 0` when the
+    /// cell carries no bindings.
+    fn id_label(cell: &panedrive::CellSpec) -> String {
+        if cell.id.is_empty() {
+            return "cell".to_string();
+        }
+        cell.id
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Build the result for a finished run: a single-run outcome envelope plus an
+    /// `id`. Byte-identical to the `run --json` summary, so a consumer parses each
+    /// line with the code it already has.
+    fn from_outcome(
+        cell: &panedrive::CellSpec,
+        outcome: &RunResult,
+        events: &[RunEvent],
+        artifacts: Option<Value>,
+    ) -> Self {
+        let ok = matches!(outcome, RunResult::Passed);
+        let steps_json: Vec<Value> = events.iter().map(RunEvent::to_json).collect();
+        let mut m = serde_json::Map::new();
+        m.insert("schema".into(), serde_json::json!(OUTCOME_SCHEMA));
+        m.insert("ok".into(), serde_json::json!(ok));
+        m.insert(
+            "outcome".into(),
+            serde_json::json!(if ok { "passed" } else { "failed" }),
+        );
+        if let RunResult::Failed(failure) = outcome {
+            m.insert("failed_step".into(), serde_json::json!(failure.step));
+            m.insert("failure".into(), failure.to_json());
+        }
+        if let Some(ap) = artifacts {
+            m.insert("artifacts".into(), ap);
+        }
+        m.insert("steps".into(), serde_json::json!(steps_json));
+        m.insert("id".into(), Self::id_object(cell));
+        CellReport {
+            ok,
+            line: Value::Object(m).to_string(),
+            human: format!(
+                "{}: {}",
+                Self::id_label(cell),
+                if ok { "passed" } else { "failed" }
+            ),
+        }
+    }
+
+    /// Build a failed result for a cell that could not be spawned or run.
+    fn error(cell: &panedrive::CellSpec, err: &str) -> Self {
+        let mut m = serde_json::Map::new();
+        m.insert("schema".into(), serde_json::json!(OUTCOME_SCHEMA));
+        m.insert("ok".into(), serde_json::json!(false));
+        m.insert("outcome".into(), serde_json::json!("failed"));
+        m.insert("error".into(), serde_json::json!(err));
+        m.insert("steps".into(), serde_json::json!(Vec::<Value>::new()));
+        m.insert("id".into(), Self::id_object(cell));
+        CellReport {
+            ok: false,
+            line: Value::Object(m).to_string(),
+            human: format!("{}: error: {err}", Self::id_label(cell)),
+        }
+    }
+}
+
 /// The `schema` version stamped on every `run` summary. Bumped only on a
 /// breaking change to the summary envelope (see `docs/design/outcome-model.md`).
 const OUTCOME_SCHEMA: u32 = 1;
@@ -820,7 +1231,8 @@ fn spawn_record(
             let _ = w.write_output(bytes);
         }
     });
-    let backend = panedrive::PtyBackend::spawn_tapped(&prog, &arg_refs, rows, cols, Some(tap))?;
+    let backend =
+        panedrive::PtyBackend::spawn_tapped(&prog, &arg_refs, rows, cols, &[], Some(tap))?;
 
     // Put the terminal in raw mode so individual keystrokes reach us (skipped
     // when stdin is piped, which is how the loop is exercised in tests). The
@@ -965,6 +1377,7 @@ fn run_backend(
     program: Vec<String>,
     rows: u16,
     cols: u16,
+    env: &[(String, String)],
     cast: Option<PathBuf>,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     match backend {
@@ -985,7 +1398,7 @@ fn run_backend(
             })?;
             Ok(Box::new(ScreenBackend::new(session)))
         }
-        Backend::Pty => spawn_pty(program, rows, cols, cast),
+        Backend::Pty => spawn_pty(program, rows, cols, env, cast),
     }
 }
 
@@ -994,6 +1407,7 @@ fn spawn_pty(
     program: Vec<String>,
     rows: u16,
     cols: u16,
+    env: &[(String, String)],
     cast: Option<PathBuf>,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     use panedrive::backend::pty::OutputTap;
@@ -1023,7 +1437,7 @@ fn spawn_pty(
         None => None,
     };
     Ok(Box::new(panedrive::PtyBackend::spawn_tapped(
-        &prog, &arg_refs, rows, cols, tap,
+        &prog, &arg_refs, rows, cols, env, tap,
     )?))
 }
 
@@ -1044,6 +1458,7 @@ fn spawn_pty(
     _program: Vec<String>,
     _rows: u16,
     _cols: u16,
+    _env: &[(String, String)],
     _cast: Option<PathBuf>,
 ) -> anyhow::Result<Box<dyn PaneBackend>> {
     anyhow::bail!("the pty backend requires building panedrive with `--features pty`")
@@ -1097,9 +1512,9 @@ mod resolve_tests {
     fn run_backend_requires_a_pane_for_attach_backends() {
         // Each attach backend errors on a missing --pane without spawning
         // anything. The pty arm is feature-gated and not exercised here.
-        assert!(run_backend(Backend::Tmux, None, vec![], 24, 80, None).is_err());
-        assert!(run_backend(Backend::Zellij, None, vec![], 24, 80, None).is_err());
-        assert!(run_backend(Backend::Screen, None, vec![], 24, 80, None).is_err());
+        assert!(run_backend(Backend::Tmux, None, vec![], 24, 80, &[], None).is_err());
+        assert!(run_backend(Backend::Zellij, None, vec![], 24, 80, &[], None).is_err());
+        assert!(run_backend(Backend::Screen, None, vec![], 24, 80, &[], None).is_err());
     }
 }
 
@@ -1127,5 +1542,118 @@ mod pty_program_tests {
     #[test]
     fn missing_path_like_program_is_left_unchanged() {
         assert_eq!(resolve_pty_program("./no/such/prog"), "./no/such/prog");
+    }
+}
+
+#[cfg(test)]
+mod suite_report_tests {
+    use super::CellReport;
+    use panedrive::{CellSpec, FailReason, RunResult, StepFailure};
+
+    fn cell() -> CellSpec {
+        CellSpec {
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            id: vec![("size".into(), "24x80".into()), ("SEED".into(), "3".into())],
+        }
+    }
+
+    #[test]
+    fn passed_cell_builds_a_labelled_envelope() {
+        let r = CellReport::from_outcome(&cell(), &RunResult::Passed, &[], None);
+        assert!(r.ok);
+        let v: serde_json::Value = serde_json::from_str(&r.line).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["outcome"], "passed");
+        assert_eq!(v["id"]["size"], "24x80");
+        assert_eq!(v["id"]["SEED"], "3");
+        assert_eq!(r.human, "size=24x80 SEED=3: passed");
+        assert!(v.get("artifacts").is_none(), "no bundle on a pass");
+    }
+
+    #[test]
+    fn failed_cell_carries_the_failure() {
+        let fail = StepFailure {
+            step: 2,
+            kind: "assert",
+            cond: "x=1".into(),
+            path: "x".into(),
+            reason: FailReason::NoState,
+        };
+        let r = CellReport::from_outcome(&cell(), &RunResult::Failed(fail), &[], None);
+        assert!(!r.ok);
+        let v: serde_json::Value = serde_json::from_str(&r.line).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["outcome"], "failed");
+        assert_eq!(v["failed_step"], 2);
+        assert!(v["failure"].is_object());
+        assert!(r.human.ends_with(": failed"));
+    }
+
+    #[test]
+    fn a_failed_cell_carries_the_artifacts_pointer_when_a_bundle_was_written() {
+        let fail = StepFailure {
+            step: 1,
+            kind: "assert",
+            cond: "x=1".into(),
+            path: "x".into(),
+            reason: FailReason::NoState,
+        };
+        let bundle = serde_json::json!({ "dir": "/tmp/art/000-size=24x80_SEED=3" });
+        let r =
+            CellReport::from_outcome(&cell(), &RunResult::Failed(fail), &[], Some(bundle.clone()));
+        let v: serde_json::Value = serde_json::from_str(&r.line).unwrap();
+        assert_eq!(
+            v["artifacts"], bundle,
+            "the cell envelope points at its bundle"
+        );
+    }
+
+    #[test]
+    fn cell_slug_is_filesystem_safe_and_index_prefixed() {
+        // The index prefixes every slug (stable ordering, guaranteed uniqueness),
+        // and any character unsafe in a path (here the `=` and space of the label,
+        // and a stray `/`) is replaced with `_`.
+        let c = CellSpec {
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            id: vec![("mode".into(), "a/b".into())],
+        };
+        assert_eq!(super::cell_slug(7, &c), "007-mode_a_b");
+        let empty = CellSpec {
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            id: vec![],
+        };
+        assert_eq!(super::cell_slug(0, &empty), "000");
+    }
+
+    #[test]
+    fn error_cell_is_failed_with_an_error_field() {
+        let r = CellReport::error(&cell(), "spawn boom");
+        assert!(!r.ok);
+        let v: serde_json::Value = serde_json::from_str(&r.line).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["outcome"], "failed");
+        assert_eq!(v["error"], "spawn boom");
+        assert!(r.human.contains("error: spawn boom"));
+    }
+
+    #[test]
+    fn a_cell_with_no_bindings_labels_as_cell() {
+        let empty = CellSpec {
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            id: vec![],
+        };
+        let r = CellReport::from_outcome(&empty, &RunResult::Passed, &[], None);
+        assert_eq!(r.human, "cell: passed");
+        let v: serde_json::Value = serde_json::from_str(&r.line).unwrap();
+        assert!(v["id"].as_object().unwrap().is_empty());
     }
 }

@@ -29,19 +29,22 @@ impl DumpState for Counter {
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("counter.state.json"));
-
     let mut c = Counter {
         count: 0,
         last: "start".to_string(),
         ready: true,
     };
+    // Prefer $PANEDRIVE_STATE (so `panedrive run` and its suite runner can point
+    // each cell at an isolated seam path), falling back to argv or a default.
     // A stateful writer stamps `_meta.seq` on each change, so a driver can use
     // `panedrive run --ack` to wait for the app to acknowledge a keypress.
-    let mut writer = SnapshotWriter::new(path);
+    let mut writer = SnapshotWriter::from_env().unwrap_or_else(|| {
+        let path = std::env::args()
+            .nth(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("counter.state.json"));
+        SnapshotWriter::new(path)
+    });
     writer.write(&c).expect("write initial snapshot");
 
     let stdin = std::io::stdin();
