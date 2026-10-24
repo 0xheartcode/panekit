@@ -5,11 +5,11 @@ keywords = ["tui", "terminal", "tmux", "testing", "automation"]
 categories = ["development-tools::testing", "command-line-utilities"]
 readme = "README.md"
 # Decoupled from the workspace version: panedrive and paneview are versioned and
-# released independently. panedrive ships 0.1.6 (CI robustness and honest input
-# timing) and depends on paneview 0.1.4 (the seam contract check it reuses, plus
-# the _meta.seq frame counter input-ack reads); see [workspace.dependencies] in
-# the root Cargo.toml.
-version = "0.1.6"
+# released independently. panedrive ships 0.1.7 (suite runner and richer
+# assertions) and depends on paneview 0.1.4 (the seam contract check it reuses,
+# plus the _meta.seq frame counter input-ack reads); see [workspace.dependencies]
+# in the root Cargo.toml.
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

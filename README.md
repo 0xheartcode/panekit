@@ -167,7 +167,9 @@ A script path and `-e` are mutually exclusive, and one of the two is required.
 Steps: `press <keys>`, `type <text>` (also `type --from-env VAR` and
 `type --paste ...` for secrets, see below), `wait-until <cond> [--timeout-ms N]
 [--interval-ms N]`, `assert <cond>`, `expect-screen <substring>`,
-`expect-no-screen <substring>`, `capture`, `sleep <200ms|1s|N>`. The run stops at
+`expect-no-screen <substring>`, `expect-golden <file>` (compare the rendered
+screen to a stored golden, or record it with `run --update-goldens`), `capture`,
+`sleep <200ms|1s|N>`. The run stops at
 the first failing step and maps to the same exit codes (`0` all passed, `1` a
 step failed, `2` usage or backend error). `run` is the only way to drive the
 **PTY** backend from the CLI, because that backend spawns and owns the target
@@ -178,6 +180,8 @@ program, so it must live for the whole script.
 regex yet), catching layout or clipping bugs a correct seam cannot see, such as a
 key legend that never displays or a stack trace on screen. An unmet
 `expect-screen` / `expect-no-screen` fails the run just like a failing `assert`.
+To inspect styling rather than just text, `panedrive capture --ansi` prints the
+visible screen with colour and attributes preserved (pty backend).
 
 On the **PTY** backend, `run` also fails if the program it spawned exits
 unexpectedly, before the script ends or with a non-zero status, so a crash after
@@ -235,6 +239,8 @@ uninstrumented app. Less precise than a real seam, but it degrades gracefully.
 | `bag.count!=0` | path exists and its scalar differs |
 | `bag.count>2` | numeric compare (`>`, `<`, `>=`, `<=`) |
 | `line~=Ready` | the scalar contains the substring |
+| `line=~Re*dy` | the scalar matches a glob (`*` any run, `?` one char), anchored |
+| `rows#=3` | length of the array/string/object (`#=`, `#>`, `#<`, `#>=`, `#<=`) |
 | `rows.2=x` | array indices are path segments |
 
 Equality is numeric-aware: `count=2` matches a JSON `2` or `2.0` (and `1e3`

@@ -92,3 +92,35 @@ fn a_running_childs_blank_screen_is_not_masked_by_the_retained_frame() {
     );
     // Dropping the backend kills it.
 }
+
+#[test]
+fn capture_styled_preserves_ansi_while_plain_flattens_it() {
+    // Red foreground text, then stay alive so we read the live screen.
+    let backend = PtyBackend::spawn(
+        "sh",
+        &["-c", "printf '\\033[31mRED-TEXT\\033[0m'; sleep 5"],
+        24,
+        80,
+    )
+    .expect("spawn the coloured program");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let styled = backend.capture_styled().expect("styled capture");
+    let plain = backend.capture().expect("plain capture");
+
+    assert!(plain.contains("RED-TEXT"), "plain capture text: {plain:?}");
+    assert!(
+        styled.contains("RED-TEXT"),
+        "styled capture text: {styled:?}"
+    );
+    // The styled capture carries ANSI escape(s); the plain one is stripped.
+    assert!(
+        styled.contains('\u{1b}'),
+        "styled capture should preserve ANSI escapes, got: {styled:?}"
+    );
+    assert!(
+        !plain.contains('\u{1b}'),
+        "plain capture must be free of escapes, got: {plain:?}"
+    );
+    // Dropping the backend kills it.
+}

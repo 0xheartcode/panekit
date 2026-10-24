@@ -214,6 +214,18 @@ impl PaneBackend for PtyBackend {
         Ok(current)
     }
 
+    fn capture_styled(&self) -> io::Result<String> {
+        // vt100 renders the current screen back to an ANSI escape stream, so
+        // colours and attributes survive. (The post-exit plain-text fallback in
+        // `capture` has no styled equivalent; a styled capture after exit returns
+        // the restored screen.)
+        let parser = self
+            .screen
+            .lock()
+            .map_err(|_| io::Error::other("pty screen poisoned"))?;
+        Ok(String::from_utf8_lossy(&parser.screen().contents_formatted()).into_owned())
+    }
+
     fn child_exit(&self) -> Option<ChildExit> {
         match self.child.lock() {
             // A reported exit carries the code; `try_wait` erroring means we

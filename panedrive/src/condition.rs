@@ -11,6 +11,8 @@
 //! | `bag.count!=0`    | the path exists and its scalar differs           |
 //! | `bag.count>2`     | numeric compare (`>`, `<`, `>=`, `<=`)           |
 //! | `line~=Ready`     | the scalar at the path contains the substring    |
+//! | `line=~Re*dy`     | the scalar matches a glob (`*` any run, `?` one)  |
+//! | `rows#=3`         | the array/string/object length (`#=` `#>` `#<` …) |
 //! | `rows.2=x`        | array indices are path segments                  |
 //!
 //! Scalars (string/bool/number/null) compare by their textual form; objects and
@@ -39,6 +41,56 @@ impl NumOp {
             NumOp::Lt => "<",
             NumOp::Ge => ">=",
             NumOp::Le => "<=",
+        }
+    }
+
+    /// Apply the comparison of `a` against `b`.
+    fn apply(&self, a: f64, b: f64) -> bool {
+        match self {
+            NumOp::Gt => a > b,
+            NumOp::Lt => a < b,
+            NumOp::Ge => a >= b,
+            NumOp::Le => a <= b,
+        }
+    }
+}
+
+/// A length comparison operator (the `#`-prefixed family): compares the *length*
+/// of an array, string, or object at the path, rather than its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LenOp {
+    /// Length equals (`#=`).
+    Eq,
+    /// Length greater than (`#>`).
+    Gt,
+    /// Length less than (`#<`).
+    Lt,
+    /// Length greater than or equal (`#>=`).
+    Ge,
+    /// Length less than or equal (`#<=`).
+    Le,
+}
+
+impl LenOp {
+    /// The operator's source symbol, for reconstructing a condition spec.
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            LenOp::Eq => "#=",
+            LenOp::Gt => "#>",
+            LenOp::Lt => "#<",
+            LenOp::Ge => "#>=",
+            LenOp::Le => "#<=",
+        }
+    }
+
+    /// Apply the comparison of a length `a` against `b`.
+    fn apply(&self, a: f64, b: f64) -> bool {
+        match self {
+            LenOp::Eq => a == b,
+            LenOp::Gt => a > b,
+            LenOp::Lt => a < b,
+            LenOp::Ge => a >= b,
+            LenOp::Le => a <= b,
         }
     }
 }
@@ -95,8 +147,13 @@ pub enum Condition {
     NotEquals(String, String),
     /// The scalar at the dot-path contains the given substring.
     Contains(String, String),
+    /// The scalar at the dot-path matches the given glob (`*` any run, `?` one).
+    Glob(String, String),
     /// The numeric scalar at the dot-path compares to the given number.
     Compare(String, NumOp, String),
+    /// The length of the array/string/object at the dot-path compares to the
+    /// given number.
+    Len(String, LenOp, String),
 }
 
 impl Condition {
@@ -105,6 +162,44 @@ impl Condition {
     /// all) means existence.
     pub fn parse(spec: &str) -> anyhow::Result<Condition> {
         let s = spec.trim();
+        // Length operators (`#`-prefixed) first: they embed `=`/`>`/`<`, so they
+        // must be matched before the value operators below split on those
+        // symbols. Longest-first within the family (`#>=` before `#>`).
+        if let Some((path, want)) = s.split_once("#>=") {
+            return Ok(Condition::Len(
+                clean_path(path),
+                LenOp::Ge,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("#<=") {
+            return Ok(Condition::Len(
+                clean_path(path),
+                LenOp::Le,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("#=") {
+            return Ok(Condition::Len(
+                clean_path(path),
+                LenOp::Eq,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("#>") {
+            return Ok(Condition::Len(
+                clean_path(path),
+                LenOp::Gt,
+                want.trim().into(),
+            ));
+        }
+        if let Some((path, want)) = s.split_once("#<") {
+            return Ok(Condition::Len(
+                clean_path(path),
+                LenOp::Lt,
+                want.trim().into(),
+            ));
+        }
         // Order matters: two-char operators before their one-char prefixes.
         if let Some((path, want)) = s.split_once(">=") {
             return Ok(Condition::Compare(
@@ -125,6 +220,10 @@ impl Condition {
         }
         if let Some((path, want)) = s.split_once("~=") {
             return Ok(Condition::Contains(clean_path(path), want.trim().into()));
+        }
+        // `=~` (glob) before the single-char `=`, since it embeds it.
+        if let Some((path, want)) = s.split_once("=~") {
+            return Ok(Condition::Glob(clean_path(path), want.trim().into()));
         }
         if let Some((path, want)) = s.split_once('>') {
             return Ok(Condition::Compare(
@@ -157,7 +256,9 @@ impl Condition {
             | Condition::Equals(p, _)
             | Condition::NotEquals(p, _)
             | Condition::Contains(p, _)
-            | Condition::Compare(p, _, _) => p,
+            | Condition::Glob(p, _)
+            | Condition::Compare(p, _, _)
+            | Condition::Len(p, _, _) => p,
         }
     }
 
@@ -169,12 +270,25 @@ impl Condition {
             Condition::Equals(p, w) => format!("{p}={w}"),
             Condition::NotEquals(p, w) => format!("{p}!={w}"),
             Condition::Contains(p, w) => format!("{p}~={w}"),
+            Condition::Glob(p, w) => format!("{p}=~{w}"),
             Condition::Compare(p, op, w) => format!("{p}{}{w}", op.symbol()),
+            Condition::Len(p, op, w) => format!("{p}{}{w}", op.symbol()),
         }
     }
 
     /// What the condition's path resolved to in `root`.
     pub fn observed(&self, root: &Value) -> Observed {
+        // A length condition reports the measured length, so a failure reads
+        // `rows#=3 (rows was 2)` rather than `rows is not a scalar`.
+        if let Condition::Len(path, _, _) = self {
+            return match value_at(root, path) {
+                None => Observed::Missing,
+                Some(v) => match len_of(v) {
+                    Some(n) => Observed::Scalar(n.to_string()),
+                    None => Observed::NonScalar,
+                },
+            };
+        }
         match value_at(root, self.path()) {
             None => Observed::Missing,
             Some(Value::Object(_) | Value::Array(_)) => Observed::NonScalar,
@@ -213,6 +327,10 @@ impl Condition {
                 Some(got) => got.contains(want.as_str()),
                 None => false,
             },
+            Condition::Glob(path, pat) => match scalar_at(root, path) {
+                Some(got) => glob_match(&got, pat),
+                None => false,
+            },
             // Both sides must be numeric and the path must exist; otherwise the
             // comparison is unsatisfied rather than erroring.
             Condition::Compare(path, op, want) => {
@@ -220,12 +338,15 @@ impl Condition {
                     scalar_at(root, path).and_then(|g| g.parse::<f64>().ok()),
                     want.parse::<f64>(),
                 ) {
-                    (Some(got), Ok(want)) => match op {
-                        NumOp::Gt => got > want,
-                        NumOp::Lt => got < want,
-                        NumOp::Ge => got >= want,
-                        NumOp::Le => got <= want,
-                    },
+                    (Some(got), Ok(want)) => op.apply(got, want),
+                    _ => false,
+                }
+            }
+            // The path must resolve to something with a length (array/string/
+            // object) and the bound must be numeric; otherwise it is unsatisfied.
+            Condition::Len(path, op, want) => {
+                match (value_at(root, path).and_then(len_of), want.parse::<f64>()) {
+                    (Some(len), Ok(want)) => op.apply(len as f64, want),
                     _ => false,
                 }
             }
@@ -277,6 +398,51 @@ fn scalar_text(v: &Value) -> Option<String> {
         Value::Null => Some("null".to_string()),
         Value::Object(_) | Value::Array(_) => None,
     }
+}
+
+/// The length of a value that has one: an array's element count, a string's
+/// character count, or an object's key count. A number, bool, or null has no
+/// length, so a length condition on one is unsatisfied rather than an error.
+fn len_of(v: &Value) -> Option<usize> {
+    match v {
+        Value::Array(a) => Some(a.len()),
+        Value::String(s) => Some(s.chars().count()),
+        Value::Object(o) => Some(o.len()),
+        Value::Number(_) | Value::Bool(_) | Value::Null => None,
+    }
+}
+
+/// Match `text` against a glob `pat`, anchored to the whole value: `*` matches
+/// any run of characters (including none) and `?` matches exactly one. All other
+/// characters are literal (there is no escaping in this form). This is a small,
+/// dependency-free matcher, not a full regular expression.
+fn glob_match(text: &str, pat: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    // `star` remembers the last `*` seen so we can backtrack and let it absorb
+    // one more character; `mark` is where that `*` started matching in `t`.
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[cfg(test)]
@@ -379,6 +545,81 @@ mod tests {
             Condition::parse("focus~=fle").unwrap(),
             Condition::Contains("focus".into(), "fle".into())
         );
+        // `=~` (glob) must not be split by the single-char `=`.
+        assert_eq!(
+            Condition::parse("focus=~fl*t").unwrap(),
+            Condition::Glob("focus".into(), "fl*t".into())
+        );
+        // The `#` length family embeds `=`/`>`/`<` and must win over them, and
+        // `#>=`/`#<=` must bind before `#>`/`#<`.
+        assert_eq!(
+            Condition::parse("rows#=2").unwrap(),
+            Condition::Len("rows".into(), LenOp::Eq, "2".into())
+        );
+        assert_eq!(
+            Condition::parse("rows#>=2").unwrap(),
+            Condition::Len("rows".into(), LenOp::Ge, "2".into())
+        );
+        assert_eq!(
+            Condition::parse("rows#<=2").unwrap(),
+            Condition::Len("rows".into(), LenOp::Le, "2".into())
+        );
+        assert_eq!(
+            Condition::parse("rows#>1").unwrap(),
+            Condition::Len("rows".into(), LenOp::Gt, "1".into())
+        );
+        assert_eq!(
+            Condition::parse("rows#<9").unwrap(),
+            Condition::Len("rows".into(), LenOp::Lt, "9".into())
+        );
+    }
+
+    #[test]
+    fn glob_matches_anchored_wildcards() {
+        // Anchored: the whole value must match, not a substring.
+        assert!(Condition::parse("focus=~fleet").unwrap().eval(&state()));
+        assert!(Condition::parse("focus=~fl*t").unwrap().eval(&state()));
+        assert!(Condition::parse("focus=~f????").unwrap().eval(&state()));
+        assert!(Condition::parse("focus=~*").unwrap().eval(&state()));
+        assert!(Condition::parse("focus=~fle*").unwrap().eval(&state()));
+        // substring without anchors does not match the whole value
+        assert!(!Condition::parse("focus=~fle").unwrap().eval(&state()));
+        assert!(!Condition::parse("focus=~*x*").unwrap().eval(&state()));
+        assert!(!Condition::parse("focus=~f???").unwrap().eval(&state()));
+        // non-scalar / missing is unsatisfied, never a panic
+        assert!(!Condition::parse("bag=~*").unwrap().eval(&state()));
+        assert!(!Condition::parse("missing=~*").unwrap().eval(&state()));
+    }
+
+    #[test]
+    fn len_compares_array_string_and_object_length() {
+        // array length
+        assert!(Condition::parse("rows#=2").unwrap().eval(&state()));
+        assert!(Condition::parse("rows#>1").unwrap().eval(&state()));
+        assert!(Condition::parse("rows#>=2").unwrap().eval(&state()));
+        assert!(Condition::parse("rows#<3").unwrap().eval(&state()));
+        assert!(!Condition::parse("rows#=3").unwrap().eval(&state()));
+        // string length (characters)
+        assert!(Condition::parse("focus#=5").unwrap().eval(&state()));
+        assert!(Condition::parse("focus#>4").unwrap().eval(&state()));
+        // object length (keys)
+        assert!(Condition::parse("bag#=1").unwrap().eval(&state()));
+        // a scalar number/bool has no length → unsatisfied, not a panic
+        assert!(!Condition::parse("bag.count#=1").unwrap().eval(&state()));
+        assert!(!Condition::parse("open#=1").unwrap().eval(&state()));
+        assert!(!Condition::parse("missing#=0").unwrap().eval(&state()));
+        // a non-numeric bound is unsatisfied
+        assert!(!Condition::parse("rows#=two").unwrap().eval(&state()));
+    }
+
+    #[test]
+    fn len_observed_and_explain_report_the_length() {
+        let c = Condition::parse("rows#=3").unwrap();
+        assert_eq!(c.observed(&state()), Observed::Scalar("2".into()));
+        assert_eq!(c.explain(&state()), "rows#=3 (rows was 2)");
+        // a value with no length reports non-scalar
+        let c = Condition::parse("bag.count#=1").unwrap();
+        assert_eq!(c.observed(&state()), Observed::NonScalar);
     }
 
     #[test]
@@ -401,8 +642,12 @@ mod tests {
             "focus=fleet",
             "bag.count!=0",
             "focus~=fle",
+            "focus=~fl*t",
             "bag.count>=2",
             "bag.count<9",
+            "rows#=2",
+            "rows#>=2",
+            "rows#<9",
         ] {
             assert_eq!(Condition::parse(spec).unwrap().to_spec(), spec);
         }

@@ -21,6 +21,17 @@ Ships `panedrive` only. Theme: CI robustness and honest input timing. Additive a
 - **Relocatable failure bundle**: the `--artifacts` `manifest.json` now references its members (`screen.txt`, `seam.json`, `events.jsonl`) by bare basename instead of the absolute path they were written at, so the bundle can be uploaded as a CI artifact and inspected after it is downloaded on another machine. The run summary's `artifacts` object keeps full paths for the operator on the machine that ran.
 - panedrive now depends on paneview 0.1.4.
 
+## [panedrive 0.1.7] - 2026-10-22
+
+Ships `panedrive` only. Theme: a suite runner (matrix and parameter sweep) and richer assertions. Additive and backward compatible. Reuses `paneview` 0.1.4.
+
+### Added
+
+- **Glob condition operator `=~`**: `line=~Re*dy` matches a scalar against a shell-style glob (`*` any run of characters, `?` exactly one), anchored to the whole value, alongside the existing `~=` substring match. Dependency-free (a small matcher, not a full regular expression).
+- **Length condition operators (`#=` `#>` `#<` `#>=` `#<=`)**: `rows#=3` asserts the length of the array, string (characters), or object (keys) at the path, so you need not emit a separate count field. A length on a scalar number or bool is unsatisfied, never an error.
+- **`capture --ansi`**: capture the pane's visible text with colour and text attributes preserved as an ANSI escape stream, instead of flattening to plain text, so you can inspect styling a plain capture drops (pty backend; other backends fall back to plain text).
+- **`expect-golden <file>` step and `run --update-goldens`**: assert the rendered screen against a stored golden file, or record/refresh goldens by running with `--update-goldens` (or `PANEDRIVE_UPDATE_GOLDENS=1`). A missing golden fails with a message telling you to record it. Goldens are normalized (trailing whitespace and trailing blank lines trimmed) so they stay stable against a backend's cell padding and the pane height.
+
 ## [paneview 0.1.4] - 2026-10-23
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.

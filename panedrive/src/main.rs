@@ -78,6 +78,10 @@ enum Cmd {
         pane: String,
         #[arg(long, value_enum, default_value_t = Backend::Tmux)]
         backend: Backend,
+        /// Preserve colour and text attributes as an ANSI escape stream instead
+        /// of flattening to plain text (pty backend; others fall back to plain).
+        #[arg(long)]
+        ansi: bool,
     },
     /// Poll the state seam until a condition holds (or time out).
     WaitUntil {
@@ -250,6 +254,10 @@ struct RunArgs {
     /// without a re-run. Secrets from `type --from-env` are never recorded.
     #[arg(long, value_name = "DIR")]
     artifacts: Option<PathBuf>,
+    /// Record or refresh goldens instead of asserting them: each
+    /// `expect-golden` step writes the current screen to its file and passes.
+    #[arg(long, env = "PANEDRIVE_UPDATE_GOLDENS")]
+    update_goldens: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -292,7 +300,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             backend,
             paste,
         } => cmd_type(text, stdin, from_env, pane, backend, paste),
-        Cmd::Capture { pane, backend } => cmd_capture(pane, backend),
+        Cmd::Capture {
+            pane,
+            backend,
+            ansi,
+        } => cmd_capture(pane, backend, ansi),
         Cmd::WaitUntil {
             cond,
             state,
@@ -349,9 +361,15 @@ fn cmd_type(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `capture`: print a pane's visible text.
-fn cmd_capture(pane: String, backend: Backend) -> anyhow::Result<ExitCode> {
-    print!("{}", backend_for(backend, pane)?.capture()?);
+/// `capture`: print a pane's visible text, optionally with ANSI styling.
+fn cmd_capture(pane: String, backend: Backend, ansi: bool) -> anyhow::Result<ExitCode> {
+    let b = backend_for(backend, pane)?;
+    let text = if ansi {
+        b.capture_styled()?
+    } else {
+        b.capture()?
+    };
+    print!("{text}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -547,6 +565,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         timeout_scale,
         retry_timeouts,
         artifacts,
+        update_goldens,
     } = args;
     if cast.is_some() && !matches!(backend, Backend::Pty | Backend::Tmux) {
         anyhow::bail!("--cast is supported on the pty and tmux backends only");
@@ -609,6 +628,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<ExitCode> {
         fail_on,
         allow_exit,
         timeout_scale,
+        update_goldens,
     };
     let state_ref = state.as_deref();
 
