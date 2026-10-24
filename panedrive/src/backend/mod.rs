@@ -39,6 +39,15 @@ pub trait PaneBackend {
     /// no [`paneview`](https://docs.rs/paneview) JSON seam is available).
     fn capture(&self) -> io::Result<String>;
 
+    /// Capture the visible text *with styling*, as an ANSI escape stream
+    /// (colours and text attributes preserved), for inspecting or asserting on
+    /// what plain [`capture`](Self::capture) flattens away. The default returns
+    /// the plain capture; a backend that models cell styling (the PTY backend)
+    /// overrides it. Surfaced by `capture --ansi`.
+    fn capture_styled(&self) -> io::Result<String> {
+        self.capture()
+    }
+
     /// Deliver literal text to the pane as a block rather than key events.
     ///
     /// The default types it character by character. The tmux backend overrides

@@ -1,0 +1,19 @@
+# Drive the Python counter example through the panekit seam (needs python3 on PATH).
+#
+#   panedrive run adapters/python/counter.pds --backend pty \
+#     --state /tmp/py-counter.json \
+#     -- python3 "$(pwd)/adapters/python/example_counter.py" /tmp/py-counter.json
+#
+# (The script and state paths are absolute: the pty backend spawns `python3`
+# with its own working directory, so a relative script path may not resolve.)
+#
+# It proves the seam is language-agnostic: identical driving script and
+# conditions as the Rust counter_tui and Node examples, against a Python app.
+
+type inc
+press Enter
+wait-until count=1 --timeout-ms 4000
+type inc
+press Enter
+wait-until count=2 --timeout-ms 4000
+assert last=inc

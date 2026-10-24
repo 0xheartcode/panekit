@@ -25,7 +25,9 @@ in any language can expose a seam by writing the same file, and every
    snapshot after a change, `wait-until` will just time out.
 4. **Keep values scalar where you assert.** Conditions compare scalar leaves
    (string/number/bool). Numbers and booleans compare by text (`count=2` matches
-   `2` or `2.0`); `~=` matches substrings; `>` `<` `>=` `<=` compare numerically.
+   `2` or `2.0`); `~=` matches substrings; `=~` matches a glob (`*` any run, `?`
+   one char); `#=` `#>` `#<` `#>=` `#<=` compare the length of an array, string,
+   or object; `>` `<` `>=` `<=` compare numerically.
 5. **`_meta` is reserved.** A top-level key named `_meta` is reserved for the
    writer and the driver, not your app state. The Rust `SnapshotWriter` puts a
    monotonic frame counter at `_meta.seq` (incremented only when the state

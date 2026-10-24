@@ -101,14 +101,20 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// app instances or parallel tests, cannot clobber each other's temp file before
 /// the rename. The rename itself is atomic on the same filesystem.
 pub fn write_snapshot(state: &impl DumpState, path: &Path) -> io::Result<()> {
-    write_value_atomic(&state.dump_state(), path)
+    write_value_atomic(&state.dump_state(), path, true)
 }
 
 /// Atomically write an already-computed snapshot value to `path` (the shared
 /// core of [`write_snapshot`] and [`SnapshotWriter`]): bytes to a unique sibling
-/// temp file, then a rename into place.
-fn write_value_atomic(value: &Value, path: &Path) -> io::Result<()> {
-    let json = serde_json::to_vec_pretty(value)?;
+/// temp file, then a rename into place. `pretty` selects indented JSON (the
+/// default, readable) or compact single-line JSON (smaller, fewer bytes to write
+/// and read each frame).
+fn write_value_atomic(value: &Value, path: &Path, pretty: bool) -> io::Result<()> {
+    let json = if pretty {
+        serde_json::to_vec_pretty(value)?
+    } else {
+        serde_json::to_vec(value)?
+    };
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.{}.tmp", std::process::id(), seq));
@@ -173,16 +179,19 @@ pub struct SnapshotWriter {
     seq: u64,
     last: Option<Value>,
     meta: bool,
+    compact: bool,
 }
 
 impl SnapshotWriter {
-    /// A writer targeting `path`, with the `_meta.seq` frame counter enabled.
+    /// A writer targeting `path`, with the `_meta.seq` frame counter enabled and
+    /// pretty (indented) output.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             seq: 0,
             last: None,
             meta: true,
+            compact: false,
         }
     }
 
@@ -200,6 +209,14 @@ impl SnapshotWriter {
     /// Skip-unchanged still applies. Chainable.
     pub fn without_meta(mut self) -> Self {
         self.meta = false;
+        self
+    }
+
+    /// Write compact single-line JSON instead of the default indented form:
+    /// fewer bytes to serialize, write, and read each frame, at the cost of
+    /// human readability. The seam content is identical either way. Chainable.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
         self
     }
 
@@ -221,7 +238,7 @@ impl SnapshotWriter {
             return Ok(false);
         }
         self.seq += 1;
-        write_value_atomic(&self.stamp(&snapshot), &self.path)?;
+        write_value_atomic(&self.stamp(&snapshot), &self.path, !self.compact)?;
         self.last = Some(snapshot);
         Ok(true)
     }
@@ -666,6 +683,24 @@ mod tests {
         assert_eq!(w.seq(), 2);
         assert_eq!(read_json(&path)["_meta"]["seq"], json!(2));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_writer_compact_writes_single_line_json() {
+        let (dir, path) = writer_tmp("compact");
+        let mut w = SnapshotWriter::new(&path).compact();
+        assert!(w.write(&Dyn(json!({ "focus": "fleet", "n": 1 }))).unwrap());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains('\n'),
+            "compact output must be a single line, got: {raw:?}"
+        );
+        // The content, including the _meta stamp, is intact, just not indented.
+        assert_eq!(
+            read_json(&path),
+            json!({ "focus": "fleet", "n": 1, "_meta": { "seq": 1 } })
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

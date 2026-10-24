@@ -47,6 +47,10 @@ For a one-off (no counter, no skip), `paneview::write_snapshot_from_env(&app)`
 writes to `$PANEDRIVE_STATE` when set and is a no-op otherwise.
 `paneview::STATE_ENV` names the variable.
 
+Add `.compact()` (e.g. `SnapshotWriter::new(path).compact()`) to write compact
+single-line JSON instead of the indented default: fewer bytes per frame, same
+seam content.
+
 ## Check your own snapshot
 
 You do not need the driver to test that your snapshot is well formed.

@@ -74,6 +74,9 @@ pub enum Step {
     ExpectScreen(String),
     /// Assert the pane's currently visible text does NOT contain this substring.
     ExpectNoScreen(String),
+    /// Assert the pane's rendered text matches a stored golden file (or write it
+    /// when running with golden-update enabled). The value is the golden path.
+    ExpectGolden(String),
     /// Emit the pane's currently visible text.
     Capture,
     /// Pause for the given duration.
@@ -157,6 +160,14 @@ pub enum FailReason {
         /// The pattern that matched the output.
         pattern: String,
     },
+    /// An `expect-golden` step did not match its stored golden file.
+    GoldenMismatch {
+        /// The golden file path.
+        path: String,
+        /// `true` when the golden file did not exist (record it with golden
+        /// update); `false` when it existed but the screen differed.
+        missing: bool,
+    },
 }
 
 impl StepFailure {
@@ -224,6 +235,19 @@ impl StepFailure {
                 "step {}: the program output matched --fail-on {pattern:?}",
                 self.step
             ),
+            FailReason::GoldenMismatch { path, missing } => {
+                if *missing {
+                    format!(
+                        "step {}: golden {path:?} does not exist (record it with --update-goldens)",
+                        self.step
+                    )
+                } else {
+                    format!(
+                        "step {}: the screen did not match golden {path:?}",
+                        self.step
+                    )
+                }
+            }
         }
     }
 
@@ -263,6 +287,11 @@ impl StepFailure {
             FailReason::OutputMatched { pattern } => {
                 m.insert("error".into(), "output matched".into());
                 m.insert("pattern".into(), pattern.clone().into());
+            }
+            FailReason::GoldenMismatch { path, missing } => {
+                m.insert("error".into(), "golden mismatch".into());
+                m.insert("golden".into(), path.clone().into());
+                m.insert("missing".into(), (*missing).into());
             }
         }
         Value::Object(m)
@@ -323,6 +352,17 @@ fn keys_detail(keys: &[Key]) -> String {
     out
 }
 
+/// Normalize a captured screen for golden comparison: trim trailing whitespace
+/// from each line and drop trailing blank lines, so a golden is stable against a
+/// backend's cell padding and does not depend on the exact pane height.
+fn normalize_screen(s: &str) -> String {
+    let mut lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 impl Step {
     /// Parse one script line. Blank lines and `#` comments return `None`.
     pub fn parse(line: &str) -> anyhow::Result<Option<Step>> {
@@ -352,6 +392,7 @@ impl Step {
             "assert" => Step::Assert(Condition::parse(first_token(rest)?)?),
             "expect-screen" => Step::ExpectScreen(parse_pattern(rest, "expect-screen")?),
             "expect-no-screen" => Step::ExpectNoScreen(parse_pattern(rest, "expect-no-screen")?),
+            "expect-golden" => Step::ExpectGolden(first_token(rest)?.to_string()),
             other => anyhow::bail!("unknown step {other:?}"),
         };
         Ok(Some(step))
@@ -402,6 +443,10 @@ pub struct RunOptions {
     /// multiplied by `factor`, so one script runs on a slow or loaded box
     /// without editing each step. `None` means a factor of 1 (no scaling).
     pub timeout_scale: Option<f64>,
+    /// When `true`, an `expect-golden` step writes the current rendered screen to
+    /// its golden file and passes, instead of comparing against it. Use it to
+    /// record or refresh goldens; leave it `false` to assert.
+    pub update_goldens: bool,
 }
 
 impl RunOptions {
@@ -440,6 +485,13 @@ impl RunOptions {
     /// Scale every `wait-until` timeout and the settle wait by `factor`.
     pub fn with_timeout_scale(mut self, factor: f64) -> Self {
         self.timeout_scale = Some(factor);
+        self
+    }
+
+    /// Record/refresh goldens instead of asserting them: an `expect-golden` step
+    /// writes the current screen to its file and passes.
+    pub fn with_update_goldens(mut self, update: bool) -> Self {
+        self.update_goldens = update;
         self
     }
 }
@@ -607,6 +659,51 @@ pub fn run_script(
                     ok: None,
                     actual: None,
                 });
+            }
+            Step::ExpectGolden(path) => {
+                let got = normalize_screen(&backend.capture()?);
+                if opts.update_goldens {
+                    // Record/refresh the golden and pass.
+                    if let Some(parent) = std::path::Path::new(path).parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                    }
+                    std::fs::write(path, &got)?;
+                    sink.on_event(&RunEvent {
+                        t_ms: t_ms(run_start),
+                        step: n,
+                        kind: "expect-golden",
+                        detail: path.clone(),
+                        ok: Some(true),
+                        actual: None,
+                    });
+                } else {
+                    let want = std::fs::read_to_string(path)
+                        .ok()
+                        .map(|s| normalize_screen(&s));
+                    let ok = want.as_deref() == Some(got.as_str());
+                    sink.on_event(&RunEvent {
+                        t_ms: t_ms(run_start),
+                        step: n,
+                        kind: "expect-golden",
+                        detail: path.clone(),
+                        ok: Some(ok),
+                        actual: None,
+                    });
+                    if !ok {
+                        return Ok(RunResult::Failed(StepFailure {
+                            step: n,
+                            kind: "expect-golden",
+                            cond: path.clone(),
+                            path: "screen".into(),
+                            reason: FailReason::GoldenMismatch {
+                                path: path.clone(),
+                                missing: want.is_none(),
+                            },
+                        }));
+                    }
+                }
             }
             Step::Assert(cond) => {
                 let (ok, observed, has_state) = match sink.probe() {
@@ -1091,6 +1188,16 @@ mod tests {
         assert_eq!(
             Step::parse("expect-no-screen panicked").unwrap().unwrap(),
             Step::ExpectNoScreen("panicked".to_string())
+        );
+        assert_eq!(
+            Step::parse("expect-golden goldens/home.txt")
+                .unwrap()
+                .unwrap(),
+            Step::ExpectGolden("goldens/home.txt".to_string())
+        );
+        assert!(
+            Step::parse("expect-golden").is_err(),
+            "expect-golden needs a path"
         );
         // The pattern is the whole remainder (spaces kept), surrounding
         // whitespace trimmed.
@@ -1889,6 +1996,82 @@ mod tests {
             f.reason,
             FailReason::ScreenMismatch { negate: false, .. }
         ));
+    }
+
+    #[test]
+    fn expect_golden_records_then_compares() {
+        let dir = std::env::temp_dir().join(format!(
+            "panedrive-golden-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let golden = dir.join("home.txt");
+        let backend = mock_with_screen("READY\nrow one\nrow two");
+        let line = format!("expect-golden {}", golden.display());
+        let steps = parse_script(&line).unwrap();
+
+        // Missing golden, not updating: fails as "missing".
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &backend,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap() else {
+            panic!("a missing golden must fail");
+        };
+        assert_eq!(f.kind, "expect-golden");
+        assert!(matches!(
+            f.reason,
+            FailReason::GoldenMismatch { missing: true, .. }
+        ));
+
+        // Update mode records the golden and passes.
+        assert_eq!(
+            run_script(
+                &steps,
+                &backend,
+                &RunOptions::new().with_update_goldens(true),
+                &mut probe_sink(|| None),
+            )
+            .unwrap(),
+            RunResult::Passed
+        );
+        assert!(golden.exists(), "update mode must write the golden");
+
+        // The same screen now matches the recorded golden.
+        assert_eq!(
+            run_script(
+                &steps,
+                &backend,
+                &RunOptions::new(),
+                &mut probe_sink(|| None),
+            )
+            .unwrap(),
+            RunResult::Passed
+        );
+
+        // A different screen fails as a real mismatch (not missing).
+        let changed = mock_with_screen("GONE\nrow one");
+        let RunResult::Failed(f) = run_script(
+            &steps,
+            &changed,
+            &RunOptions::new(),
+            &mut probe_sink(|| None),
+        )
+        .unwrap() else {
+            panic!("a changed screen must fail the golden");
+        };
+        assert!(matches!(
+            f.reason,
+            FailReason::GoldenMismatch { missing: false, .. }
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

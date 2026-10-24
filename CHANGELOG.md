@@ -21,6 +21,28 @@ Ships `panedrive` only. Theme: CI robustness and honest input timing. Additive a
 - **Relocatable failure bundle**: the `--artifacts` `manifest.json` now references its members (`screen.txt`, `seam.json`, `events.jsonl`) by bare basename instead of the absolute path they were written at, so the bundle can be uploaded as a CI artifact and inspected after it is downloaded on another machine. The run summary's `artifacts` object keeps full paths for the operator on the machine that ran.
 - panedrive now depends on paneview 0.1.4.
 
+## [panedrive 0.1.7] - 2026-10-24
+
+Ships `panedrive` only. Theme: a suite runner (matrix and parameter sweep) and richer assertions. Additive and backward compatible. Reuses `paneview` 0.1.4.
+
+### Added
+
+- **Glob condition operator `=~`**: `line=~Re*dy` matches a scalar against a shell-style glob (`*` any run of characters, `?` exactly one), anchored to the whole value, alongside the existing `~=` substring match. Dependency-free (a small matcher, not a full regular expression).
+- **Length condition operators (`#=` `#>` `#<` `#>=` `#<=`)**: `rows#=3` asserts the length of the array, string (characters), or object (keys) at the path, so you need not emit a separate count field. A length on a scalar number or bool is unsatisfied, never an error.
+- **`capture --ansi`**: capture the pane's visible text with colour and text attributes preserved as an ANSI escape stream, instead of flattening to plain text, so you can inspect styling a plain capture drops (pty backend; other backends fall back to plain text).
+- **`expect-golden <file>` step and `run --update-goldens`**: assert the rendered screen against a stored golden file, or record/refresh goldens by running with `--update-goldens` (or `PANEDRIVE_UPDATE_GOLDENS=1`). A missing golden fails with a message telling you to record it. Goldens are normalized (trailing whitespace and trailing blank lines trimmed) so they stay stable against a backend's cell padding and the pane height.
+- **Matrix from script directives**: a script may declare `#@size: 24x80, 40x120` (rows x cols) and/or `#@env: THEME=light, THEME=dark` directive comments, and `run` expands it across the cartesian product of those axes, running each cell with that terminal size and child environment. The `@` marker keeps a directive distinct from an ordinary `#` comment, so an existing script's plain `# size:` note is never reinterpreted. See `docs/design/suite-runner.md`.
+- **Parameter sweep `run --sweep VAR=1..8` (or `VAR=a,b,c`)**: run the script once per value, with the value set as the child environment variable `VAR`. `--jobs N` runs cells in parallel. Each cell gets an isolated seam (its own `PANEDRIVE_STATE` path), so parallel cells never collide. A multi-cell run under `--json` emits NDJSON: one self-contained outcome envelope per line (the single-run shape plus an `id` of the cell's axis bindings), written as each cell finishes. Suites are pty-only; `--cast`/`--events`/`--retry-timeouts` are not combined with a suite.
+- **Per-cell failure artifacts in a suite**: `run --artifacts <dir>` works with a matrix or sweep, writing each failing cell's bundle (screen, seam, events, manifest) under `<dir>/<NNN-id>/` and pointing at it from that cell's `artifacts` envelope field. A passing cell writes nothing.
+
+## [paneview 0.1.5] - 2026-10-23
+
+Ships `paneview` only. `panedrive` is unchanged. Additive and backward compatible.
+
+### Added
+
+- **`SnapshotWriter::compact()`**: write compact single-line JSON instead of the default indented form, so an app that snapshots on every render serializes, writes, and reads fewer bytes per frame. The seam content is identical; `write_snapshot` and the default writer stay pretty for readability.
+
 ## [paneview 0.1.4] - 2026-10-23
 
 Ships `paneview` only. `panedrive` is unchanged. Theme: ergonomics for an app that emits a snapshot every render. All additive and backward compatible; the existing `write_snapshot` and `dump_serialize` behave exactly as before.
@@ -149,6 +171,8 @@ Initial release of the two-crate toolkit for driving and verifying terminal UIs 
 - **CI**: deterministic quality gate (`make check`), cargo-deny supply-chain check, and cross-platform release binaries via cargo-dist.
 
 [panedrive 0.1.6]: https://github.com/0xheartcode/panekit/compare/panedrive-v0.1.5...v0.1.6
+[panedrive 0.1.7]: https://github.com/0xheartcode/panekit/compare/v0.1.6...v0.1.7
+[paneview 0.1.5]: https://github.com/0xheartcode/panekit/compare/v0.1.6...v0.1.7
 [paneview 0.1.4]: https://github.com/0xheartcode/panekit/compare/panedrive-v0.1.5...v0.1.6
 [panedrive 0.1.5]: https://github.com/0xheartcode/panekit/compare/v0.1.4...panedrive-v0.1.5
 [paneview 0.1.3]: https://github.com/0xheartcode/panekit/compare/v0.1.4...6d7b5df

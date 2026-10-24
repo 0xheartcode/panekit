@@ -133,3 +133,12 @@ determinism with one shared driver.
   by bare basename, not the absolute path they were written at, so the bundle
   survives being uploaded as a CI artifact and downloaded elsewhere. The live run
   summary keeps full paths for the operator on the machine that ran.
+- Suite runner (`docs/design/suite-runner.md`): a script runs across a set of
+  cells, the cartesian product of axes declared in `#@size:` / `#@env:` directives
+  (a matrix) and a `--sweep VAR=...` on the CLI. Each cell spawns a fresh child
+  with that size and environment and an isolated per-cell seam, so `--jobs N`
+  runs cells in parallel with no shared state (variables go to the child's
+  environment, never this process's). A multi-cell `--json` run emits NDJSON, one
+  self-contained outcome envelope per line plus the cell's `id`, the streamable
+  form of the aggregate the outcome model reserved. The single-run path is
+  unchanged; a run is a suite only when an axis or a sweep is present.

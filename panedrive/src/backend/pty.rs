@@ -66,17 +66,21 @@ impl PtyBackend {
     /// Spawn `program args...` in a fresh `rows`×`cols` PTY and start reading
     /// its output into the screen model.
     pub fn spawn(program: &str, args: &[&str], rows: u16, cols: u16) -> io::Result<Self> {
-        Self::spawn_tapped(program, args, rows, cols, None)
+        Self::spawn_tapped(program, args, rows, cols, &[], None)
     }
 
-    /// Like [`spawn`](Self::spawn), but also forward every raw output chunk to
-    /// `tap` as it is read (in addition to feeding the `vt100` screen model), so
-    /// a recorder can capture the byte stream this process already owns.
+    /// Like [`spawn`](Self::spawn), but also set `env` variables on the child and
+    /// forward every raw output chunk to `tap` as it is read (in addition to
+    /// feeding the `vt100` screen model), so a recorder can capture the byte
+    /// stream this process already owns. The `env` bindings are applied to the
+    /// child process only, never this process, so many children can be spawned
+    /// concurrently with different environments.
     pub fn spawn_tapped(
         program: &str,
         args: &[&str],
         rows: u16,
         cols: u16,
+        env: &[(String, String)],
         mut tap: Option<OutputTap>,
     ) -> io::Result<Self> {
         let pair = native_pty_system()
@@ -91,6 +95,9 @@ impl PtyBackend {
         let mut cmd = CommandBuilder::new(program);
         for a in args {
             cmd.arg(a);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         let child = pair
             .slave
@@ -212,6 +219,18 @@ impl PaneBackend for PtyBackend {
             }
         }
         Ok(current)
+    }
+
+    fn capture_styled(&self) -> io::Result<String> {
+        // vt100 renders the current screen back to an ANSI escape stream, so
+        // colours and attributes survive. (The post-exit plain-text fallback in
+        // `capture` has no styled equivalent; a styled capture after exit returns
+        // the restored screen.)
+        let parser = self
+            .screen
+            .lock()
+            .map_err(|_| io::Error::other("pty screen poisoned"))?;
+        Ok(String::from_utf8_lossy(&parser.screen().contents_formatted()).into_owned())
     }
 
     fn child_exit(&self) -> Option<ChildExit> {
