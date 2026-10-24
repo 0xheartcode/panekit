@@ -10,7 +10,7 @@
 //! drive for real.
 
 use panedrive::{PaneBackend, ZellijBackend, parse_keys};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn zellij_available() -> bool {
@@ -77,11 +77,20 @@ fn drives_a_live_session_end_to_end() {
     let launch = format!(
         "TERM=xterm-256color script -qfc 'zellij --session {session}' /dev/null < <(sleep 60)"
     );
+    // `setsid` detaches the host into its own session, so `host.kill()` cannot
+    // reach the `script`/`sleep` children. Give them no handle on our stdio: if
+    // they inherited the test's stdout/stderr pipe, the long-lived `sleep` would
+    // hold it open and hang `cargo test`'s output capture (the gate must never
+    // hang, per this file's contract). We drive zellij out-of-band via
+    // `zellij action`, so the host needs no stdio of its own.
     let mut host = Command::new("setsid")
         .arg("bash")
         .arg("-c")
         .arg(&launch)
         .env("ZELLIJ_CONFIG_FILE", &cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn zellij host");
 
@@ -130,6 +139,10 @@ fn drives_a_live_session_end_to_end() {
         .status();
     let _ = host.kill();
     let _ = host.wait();
+    // host.kill() only reaps the setsid parent; the detached `script`/`zellij`
+    // live in their own session. Reap them by their unique session string so no
+    // process leaks between runs.
+    let _ = Command::new("pkill").args(["-f", &session]).status();
     let _ = std::fs::remove_file(&cfg);
 
     match result {
